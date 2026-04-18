@@ -115,48 +115,47 @@ def load_team_stats(seasons: list[int]) -> pd.DataFrame:
 def load_odds_for_history(games_df: pd.DataFrame) -> pd.DataFrame:
     """
     Attach approximate odds to historical games for backtest.
-    Uses run differential as a proxy where real odds aren't cached.
+    Synthesises moneyline odds from each team's rolling win rate and
+    park factor — no merge, no groupby, just vectorised operations.
     """
     if "home_odds" in games_df.columns and games_df["home_odds"].notna().sum() > 100:
         return games_df
 
-    print("  Synthesising historical odds from run differentials...")
+    print("  Synthesising historical odds from team win rates + park factors...")
     from mlb_data import PARK_FACTORS
-    from mlb_betting import decimal_to_american
 
     df = games_df.copy()
-    # Use season win rates as rough prior, adjusted for run line
-    season_wr = (
-        df.groupby(["home_team", df["game_date"].dt.year.rename("season")])
-        ["home_win"].mean().reset_index()
-        .rename(columns={"home_win": "team_home_wr"})
+    df["game_date"] = pd.to_datetime(df["game_date"])
+
+    # Rolling 60-game home win rate per team, computed without lookahead
+    df = df.sort_values("game_date").reset_index(drop=True)
+    df["_roll_wr"] = (
+        df.groupby("home_team")["home_win"]
+        .transform(lambda x: x.shift(1).rolling(60, min_periods=10).mean())
+        .fillna(0.54)   # league-average home win rate as cold-start
     )
-    df["_season"] = df["game_date"].dt.year
-    df = df.merge(season_wr, on=["home_team", "_season"], how="left")
 
-    df["team_home_wr"] = df["team_home_wr"].fillna(0.54)
+    # Park factor nudge (already a ratio, e.g. 1.08 for Fenway)
+    pf = df["home_team"].map(PARK_FACTORS).fillna(1.00)
 
-    # Add park factor nudge
-    pf = df["home_team"].map(PARK_FACTORS).fillna(100) / 100
-    raw_prob = (df["team_home_wr"] * 0.7 + 0.54 * 0.3) * pf.clip(0.95, 1.05)
-    raw_prob = raw_prob.clip(0.35, 0.72)
+    # Blend rolling win rate with league average + park factor
+    raw_prob = ((df["_roll_wr"] * 0.65 + 0.54 * 0.35) * pf).clip(0.30, 0.72)
 
-    # Add random noise (bookmakers aren't perfect)
+    # Small random noise so every game doesn't get identical odds
     rng = np.random.default_rng(42)
-    noise = rng.normal(0, 0.025, len(df))
-    noisy_prob = (raw_prob + noise).clip(0.30, 0.72)
+    noisy_prob = (raw_prob + rng.normal(0, 0.02, len(df))).clip(0.28, 0.74)
 
-    # Convert to American odds with ~5% vig
-    def to_am(p):
-        p_vig = p * 0.95
+    def to_american(p: float) -> int:
+        p_vig = float(p) * 0.952   # ~5% vig
+        p_vig = max(0.10, min(0.90, p_vig))
         if p_vig >= 0.5:
-            return -round(p_vig / (1 - p_vig) * 100 / 5) * 5
+            return -int(round(p_vig / (1 - p_vig) * 100 / 5) * 5)
         else:
-            return round((1 - p_vig) / p_vig * 100 / 5) * 5
+            return  int(round((1 - p_vig) / p_vig * 100 / 5) * 5)
 
-    df["home_odds"] = noisy_prob.apply(to_am)
-    df["away_odds"] = (1 - noisy_prob).apply(to_am)
-    df = df.drop(columns=["team_home_wr", "_season"])
+    df["home_odds"] = noisy_prob.apply(to_american)
+    df["away_odds"] = (1 - noisy_prob).apply(to_american)
+    df = df.drop(columns=["_roll_wr"])
     return df
 
 
