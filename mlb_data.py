@@ -459,3 +459,73 @@ def compute_h2h(schedule_df: pd.DataFrame, window_games: int = 20) -> dict:
     for (home, away), games in df.groupby(["home_team", "away_team"]):
         h2h[(home, away)] = games.tail(window_games)["home_win"].mean()
     return h2h
+
+
+# ─────────────────────────────────────────────
+# Lineup stats (batting quality for a specific game)
+# ─────────────────────────────────────────────
+
+def fetch_lineup_stats(game_pk: int, season: int) -> dict:
+    """
+    Get aggregated batting stats for each team's starting lineup in a game.
+    Returns dict with keys 'home' and 'away', each containing:
+        lineup_avg, lineup_obp, lineup_slg, lineup_ops, lineup_depth
+    Falls back to league-average values if the boxscore isn't available yet.
+    """
+    LEAGUE_AVG = {
+        "lineup_avg":   0.250,
+        "lineup_obp":   0.320,
+        "lineup_slg":   0.400,
+        "lineup_ops":   0.720,
+        "lineup_depth": 9,
+    }
+
+    try:
+        data = _mlb(
+            f"game/{game_pk}/boxscore",
+            cache_key=f"lineup_{game_pk}",
+            cache_ttl_mins=360,
+        )
+    except Exception:
+        return {"home": dict(LEAGUE_AVG), "away": dict(LEAGUE_AVG)}
+
+    result = {}
+    for side in ["home", "away"]:
+        team    = data.get("teams", {}).get(side, {})
+        batters = team.get("batters", [])[:9]
+        players = team.get("players", {})
+
+        avgs, obps, slugs = [], [], []
+        for bid in batters:
+            key = f"ID{bid}"
+            p   = players.get(key, {})
+            s   = p.get("seasonStats", {}).get("batting", {})
+
+            def _stat(field, default):
+                raw = str(s.get(field, default))
+                # MLB API returns batting avg as ".250" — strip leading dot
+                raw = raw.lstrip(".")
+                try:
+                    return float(f"0.{raw}") if len(raw) <= 3 and "." not in raw else float(raw)
+                except (ValueError, TypeError):
+                    return default
+
+            avgs.append(_stat("avg",  0.250))
+            obps.append(_stat("obp",  0.320))
+            slugs.append(_stat("slg", 0.400))
+
+        if not avgs:
+            result[side] = dict(LEAGUE_AVG)
+        else:
+            avg  = float(np.mean(avgs))
+            obp  = float(np.mean(obps))
+            slg  = float(np.mean(slugs))
+            result[side] = {
+                "lineup_avg":   round(avg, 4),
+                "lineup_obp":   round(obp, 4),
+                "lineup_slg":   round(slg, 4),
+                "lineup_ops":   round(obp + slg, 4),
+                "lineup_depth": len(batters),
+            }
+
+    return result
