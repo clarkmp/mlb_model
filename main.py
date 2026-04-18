@@ -1,24 +1,27 @@
 """
-main.py
--------
-MLB Betting Model — main entry point.
+main.py — MLB Betting Model
 
 Usage:
-    python main.py                        # full train + today's picks
-    python main.py --mode train           # retrain only
-    python main.py --mode live            # today's picks only (needs saved model)
-    python main.py --bankroll 5000        # set bankroll
-    python main.py --min-edge 0.05        # require 5% edge
-    python main.py --seasons 2022 2023 2024
+    python main.py                              # train on last 3 seasons + current, then live picks
+    python main.py --mode train                 # train only
+    python main.py --mode live                  # live picks only (needs saved model)
+    python main.py --bankroll 5000
+    python main.py --min-edge 0.05
+    python main.py --seasons 2022 2023 2024 2025
+
+Bet types produced in live mode:
+    - Moneyline        (FLIFF odds)
+    - Run line spread  (FLIFF odds, -1.5 / +1.5)
+    - First 5 innings  (FLIFF odds, SP-adjusted)
+    - 3-leg parlay     (top 3 moneyline edges combined)
+    - HR props         (batter HR over 0.5, FLIFF odds)
 """
 
-import os
-import argparse
-import json
-import time
+import os, argparse, json, time
 import pandas as pd
 import numpy as np
 from pathlib import Path
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -27,6 +30,7 @@ from mlb_data import (
     fetch_season_schedule, fetch_team_season_stats,
     fetch_today_schedule, fetch_mlb_odds,
     fetch_pitcher_stats, fetch_lineup_stats,
+    fetch_hr_props, fetch_event_ids,
 )
 from mlb_features import build_features, build_game_features, TARGET_COL
 import mlb_features as _feat_module
@@ -35,68 +39,79 @@ from mlb_model import (
     save_model, load_model, predict_proba, get_feature_importance,
 )
 from mlb_betting import (
-    evaluate_game, run_backtest,
-    edge_buckets, monthly_performance,
+    evaluate_moneyline, evaluate_spread, evaluate_f5,
+    evaluate_hr_props, build_parlay,
+    run_backtest, edge_buckets, monthly_performance,
+    american_to_decimal,
 )
 
 CACHE_DIR = Path("cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-# _feature_cols() is set dynamically by build_features() — always read from module
-def _feature_cols():
-    return _feat_module.FEATURE_COLS
-
+# ── Default config ────────────────────────────────────────────────────────────
+_CURRENT_YEAR = datetime.now().year
 CONFIG = {
-    "seasons":        [2023, 2024],
+    # Train on last 3 completed seasons + current season
+    "seasons":          [_CURRENT_YEAR - 3, _CURRENT_YEAR - 2,
+                         _CURRENT_YEAR - 1, _CURRENT_YEAR],
     "initial_bankroll": 1000.0,
-    "min_edge":        0.04,
-    "kelly_frac":      0.25,
-    "max_stake_pct":   0.04,
-    "min_train_games": 300,
+    "min_edge":         0.04,
+    "kelly_frac":       0.25,
+    "max_stake_pct":    0.03,    # hard cap: 3% of bankroll per bet
+    "min_train_games":  300,
     "step_games":       30,
 }
 
-W = 110   # total output width
+W = 112   # output width
 
 
 # ─────────────────────────────────────────────
-# Print helpers — clean, aligned output
+# Print helpers
 # ─────────────────────────────────────────────
 
-def header(title: str):
+def section(title):
     print(f"\n{'─'*W}")
     print(f"  {title.upper()}")
     print(f"{'─'*W}")
 
-def kv(label: str, value, width: int = 32):
-    print(f"  {label:<{width}} {value}")
+def kv(label, value, w=34):
+    print(f"  {label:<{w}} {value}")
 
-def divider():
+def div():
     print(f"  {'─'*(W-4)}")
 
 
 # ─────────────────────────────────────────────
-# Data loading with caching
+# Data loading
 # ─────────────────────────────────────────────
 
-def load_games(seasons: list[int]) -> pd.DataFrame:
-    cache_file = CACHE_DIR / f"mlb_games_{'_'.join(map(str,seasons))}.csv"
-    if cache_file.exists():
-        df = pd.read_csv(cache_file, parse_dates=["game_date"])
-        print(f"  Loaded {len(df)} games from cache. Delete {cache_file} to refresh.")
-        return df
+def load_games(seasons):
+    # Try exact cache file, then scan for any superset
+    import glob
+    candidates = [CACHE_DIR / f"mlb_games_{'_'.join(map(str,seasons))}.csv"]
+    candidates += [Path(p) for p in sorted(glob.glob(str(CACHE_DIR / "mlb_games_*.csv")))]
+    for cf in candidates:
+        if not cf.exists():
+            continue
+        df = pd.read_csv(cf, parse_dates=["game_date"])
+        df = df[df["game_date"].dt.year.isin(seasons)]
+        if not df.empty:
+            print(f"  Loaded {len(df)} games from {cf.name}. Delete to refresh.")
+            return df
+
     print("  Fetching game history from MLB Stats API...")
     df = fetch_season_schedule(seasons)
     if not df.empty:
-        df.to_csv(cache_file, index=False)
+        fname = CACHE_DIR / f"mlb_games_{'_'.join(map(str,seasons))}.csv"
+        df.to_csv(fname, index=False)
     return df
 
 
-def load_team_stats(seasons: list[int]) -> pd.DataFrame:
+def load_team_stats(seasons):
     cache_file = CACHE_DIR / f"mlb_team_stats_{'_'.join(map(str,seasons))}.csv"
     if cache_file.exists():
         df = pd.read_csv(cache_file)
-        print(f"  Loaded team stats from cache ({len(df)} rows).")
+        print(f"  Team stats loaded from cache ({len(df)} rows).")
         return df
     dfs = []
     for s in seasons:
@@ -104,7 +119,7 @@ def load_team_stats(seasons: list[int]) -> pd.DataFrame:
             dfs.append(fetch_team_season_stats(s))
             time.sleep(0.3)
         except Exception as e:
-            print(f"  Warning: could not fetch {s} team stats: {e}")
+            print(f"  Warning: team stats {s}: {e}")
     if not dfs:
         return pd.DataFrame()
     df = pd.concat(dfs, ignore_index=True)
@@ -112,12 +127,8 @@ def load_team_stats(seasons: list[int]) -> pd.DataFrame:
     return df
 
 
-def load_odds_for_history(games_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Attach approximate odds to historical games for backtest.
-    Synthesises moneyline odds from each team's rolling win rate and
-    park factor — no merge, no groupby, just vectorised operations.
-    """
+def load_odds_for_history(games_df):
+    """Synthesise approximate historical odds for backtest simulation."""
     if "home_odds" in games_df.columns and games_df["home_odds"].notna().sum() > 100:
         return games_df
 
@@ -126,35 +137,28 @@ def load_odds_for_history(games_df: pd.DataFrame) -> pd.DataFrame:
 
     df = games_df.copy()
     df["game_date"] = pd.to_datetime(df["game_date"])
-
-    # Rolling 60-game home win rate per team, computed without lookahead
     df = df.sort_values("game_date").reset_index(drop=True)
+
     df["_roll_wr"] = (
         df.groupby("home_team")["home_win"]
         .transform(lambda x: x.shift(1).rolling(60, min_periods=10).mean())
-        .fillna(0.54)   # league-average home win rate as cold-start
+        .fillna(0.54)
     )
-
-    # Park factor nudge (already a ratio, e.g. 1.08 for Fenway)
     pf = df["home_team"].map(PARK_FACTORS).fillna(1.00)
+    raw_prob  = ((df["_roll_wr"] * 0.65 + 0.54 * 0.35) * pf).clip(0.30, 0.72)
+    rng       = np.random.default_rng(42)
+    noisy_p   = (raw_prob + rng.normal(0, 0.02, len(df))).clip(0.28, 0.74)
 
-    # Blend rolling win rate with league average + park factor
-    raw_prob = ((df["_roll_wr"] * 0.65 + 0.54 * 0.35) * pf).clip(0.30, 0.72)
-
-    # Small random noise so every game doesn't get identical odds
-    rng = np.random.default_rng(42)
-    noisy_prob = (raw_prob + rng.normal(0, 0.02, len(df))).clip(0.28, 0.74)
-
-    def to_american(p: float) -> int:
-        p_vig = float(p) * 0.952   # ~5% vig
+    def to_am(p):
+        p_vig = float(p) * 0.952
         p_vig = max(0.10, min(0.90, p_vig))
         if p_vig >= 0.5:
             return -int(round(p_vig / (1 - p_vig) * 100 / 5) * 5)
         else:
             return  int(round((1 - p_vig) / p_vig * 100 / 5) * 5)
 
-    df["home_odds"] = noisy_prob.apply(to_american)
-    df["away_odds"] = (1 - noisy_prob).apply(to_american)
+    df["home_odds"] = noisy_p.apply(to_am)
+    df["away_odds"] = (1 - noisy_p).apply(to_am)
     df = df.drop(columns=["_roll_wr"])
     return df
 
@@ -163,65 +167,62 @@ def load_odds_for_history(games_df: pd.DataFrame) -> pd.DataFrame:
 # Training pipeline
 # ─────────────────────────────────────────────
 
-def run_train(seasons: list[int]) -> tuple:
-    header("1 — loading game history")
+def run_train(seasons):
+    section("1 — loading game history")
     games_raw = load_games(seasons)
     if games_raw.empty:
-        print("  ERROR: No game data found.")
+        print("  ERROR: No game data. Check internet connection and run debug_api.py")
         return None, None, None
 
     games_raw = load_odds_for_history(games_raw)
-    kv("Games loaded:", len(games_raw))
-    kv("Seasons:", ", ".join(str(s) for s in games_raw["game_date"].dt.year.unique()))
-    kv("Teams:", games_raw["home_team"].nunique())
-    kv("Home win rate:", f"{games_raw['home_win'].mean():.1%}")
+    games_raw["game_date"] = pd.to_datetime(games_raw["game_date"])
+    kv("Games loaded:",   len(games_raw))
+    kv("Seasons:",        ", ".join(str(y) for y in sorted(games_raw["game_date"].dt.year.unique())))
+    kv("Teams:",          games_raw["home_team"].nunique())
+    kv("Home win rate:",  f"{games_raw['home_win'].mean():.1%}")
 
-    header("2 — loading team stats")
+    section("2 — loading team stats")
     team_stats = load_team_stats(seasons)
 
-    header("3 — building features")
-    df = build_features(games_raw, team_stats)
-    n_valid = df.dropna(subset=_feature_cols()).shape[0]
+    section("3 — building features")
+    df = build_features(games_raw, team_stats if not team_stats.empty else None)
+    FC = _feat_module.FEATURE_COLS
+    n_valid = df.dropna(subset=FC).shape[0]
     kv("Complete feature rows:", n_valid)
-    kv("Features:", len(_feature_cols()))
+    kv("Active features:",       len(FC))
 
     if n_valid < CONFIG["min_train_games"] + 50:
-        print(f"\n  WARNING: Only {n_valid} complete rows — need {CONFIG['min_train_games']+50}+")
-        print("  Try adding more seasons: --seasons 2022 2023 2024")
+        print(f"\n  WARNING: Only {n_valid} complete rows. "
+              f"Need {CONFIG['min_train_games']+50}+. Add more seasons.")
 
-    header("4 — walk-forward model training")
+    section("4 — walk-forward model training")
     df = walk_forward_backtest(
-        df, _feature_cols(), TARGET_COL,
+        df, FC, TARGET_COL,
         min_train_games = CONFIG["min_train_games"],
         step_games      = CONFIG["step_games"],
     )
+    n_pred = df["model_prob"].notna().sum()
+    kv("Predictions generated:", n_pred)
 
-    header("5 — model quality metrics")
-    if df["model_prob"].notna().sum() == 0:
-        print("  No predictions generated. Check that min_train_games is below dataset size.")
+    if n_pred == 0:
+        print("  ERROR: No predictions. min_train_games may exceed dataset size.")
         return None, None, None
+
+    section("5 — model quality")
     metrics = evaluate_model(df)
     kv("Games evaluated:",    metrics["n_predictions"])
-    kv("Home win rate:",       f"{metrics['home_win_rate']:.1%}")
-    kv("ROC-AUC:",             metrics["roc_auc"],         )
-    kv("Brier skill score:",   metrics["brier_skill_score"])
-    kv("Log loss:",            metrics["log_loss"])
-    kv("Forecast resolution:", metrics["forecast_resolution"])
+    kv("Home win rate:",      f"{metrics['home_win_rate']:.1%}")
+    kv("ROC-AUC:",            metrics["roc_auc"])
+    kv("Brier skill score:",  metrics["brier_skill_score"])
+    kv("Log loss:",           metrics["log_loss"])
     print()
-    print("  Calibration (predicted → actual win rate):")
+    print("  Calibration (predicted → actual):")
     for pred, actual in metrics["calibration_curve"]:
-        bar_p = "░" * int(pred * 20)
-        bar_a = "█" * int(actual * 20)
+        bar = "█" * int(actual * 20)
         diff = actual - pred
-        sign = "+" if diff >= 0 else ""
-        print(f"    {pred:.2f}  {bar_p:<20}  actual={actual:.2f}  {bar_a:<20}  {sign}{diff:.3f}")
+        print(f"    {pred:.2f} → {actual:.2f}  {bar:<20}  {'+' if diff>=0 else ''}{diff:.3f}")
 
-    if metrics["roc_auc"] > 0.55:
-        print(f"\n  ✓ AUC {metrics['roc_auc']} — model has meaningful predictive power")
-    if metrics["brier_skill_score"] > 0:
-        print(f"  ✓ Brier skill {metrics['brier_skill_score']} — beats naive baseline")
-
-    header("6 — betting backtest")
+    section("6 — betting backtest")
     ledger, summary = run_backtest(
         df,
         initial_bankroll = CONFIG["initial_bankroll"],
@@ -233,195 +234,326 @@ def run_train(seasons: list[int]) -> tuple:
     if "error" in summary:
         print(f"  {summary['error']}")
     else:
-        # Main metrics
-        divider()
-        kv("Total bets:",           summary["total_bets"])
-        kv("Win / Loss:",           f"{summary['wins']} W  {summary['losses']} L")
-        kv("Win rate:",             f"{summary['win_rate']:.1%}")
-        kv("Avg edge:",             f"{summary['avg_edge_pct']}%")
-        kv("Avg odds:",             f"+{summary['avg_odds']:.0f}" if summary['avg_odds'] >= 0 else f"{summary['avg_odds']:.0f}")
-        divider()
-        kv("Initial bankroll:",     f"${CONFIG['initial_bankroll']:,.2f}")
+        div()
+        kv("Total bets:",             summary["total_bets"])
+        kv("Win / Loss:",             f"{summary['wins']} W  {summary['losses']} L")
+        kv("Win rate:",               f"{summary['win_rate']:.1%}")
+        kv("Avg edge:",               f"{summary['avg_edge_pct']}%")
+        kv("Avg stake (fixed-base):", f"${summary['avg_stake']:.2f}")
+        kv("Avg odds:",               f"{summary['avg_odds']:+.0f}")
+        div()
+        kv("Initial bankroll:",       f"${summary['initial_bankroll']:,.2f}")
         kv("Final bankroll (Kelly):", f"${summary['final_bankroll_kelly']:,.2f}")
-        kv("Total P&L (Kelly):",    f"${summary['total_pnl_kelly']:,.2f}")
-        kv("ROI % (Kelly):",        f"{summary['roi_pct_kelly']}%")
-        kv("Max drawdown:",         f"{summary['max_drawdown_pct']}%")
-        kv("Profit factor:",        summary["profit_factor"])
-        divider()
-        kv("Flat stake ROI %:",     f"{summary['flat_roi_pct']}%")
-        kv("Flat stake final:",     f"${summary['flat_final_bankroll']:,.2f}")
-        divider()
-        kv("Max win streak:",       summary["max_win_streak"])
-        kv("Max loss streak:",      summary["max_loss_streak"])
+        kv("Total P&L:",              f"${summary['total_pnl_kelly']:,.2f}")
+        kv("ROI % (Kelly):",          f"{summary['roi_pct_kelly']}%")
+        kv("Max drawdown:",           f"{summary['max_drawdown_pct']}%")
+        kv("Profit factor:",          summary["profit_factor"])
+        div()
+        kv("Flat stake ROI %:",       f"{summary['flat_roi_pct']}%")
+        kv("Flat final bankroll:",    f"${summary['flat_final_bankroll']:,.2f}")
+        div()
+        kv("Max win streak:",         summary["max_win_streak"])
+        kv("Max loss streak:",        summary["max_loss_streak"])
 
-        # Save summary for live mode to use
         with open(CACHE_DIR / "last_summary.json", "w") as f:
             json.dump({k: v for k, v in summary.items()
                        if not isinstance(v, (list, dict))}, f)
 
-        header("6a — edge bucket analysis")
-        buckets = edge_buckets(ledger)
-        if not buckets.empty:
-            print(buckets.to_string())
+        section("6a — edge bucket analysis")
+        eb = edge_buckets(ledger)
+        if not eb.empty:
+            print(eb.to_string())
 
-        header("6b — monthly performance")
-        monthly = monthly_performance(ledger)
-        if not monthly.empty:
-            print(monthly.to_string())
+        section("6b — monthly performance")
+        mp = monthly_performance(ledger)
+        if not mp.empty:
+            print(mp.to_string())
 
-    header("7 — feature importance")
-    final_model = train_final_model(df, _feature_cols(), TARGET_COL)
-    imp = get_feature_importance(final_model, _feature_cols())
+    section("7 — feature importance")
+    final_model = train_final_model(df, FC, TARGET_COL)
+    imp = get_feature_importance(final_model, FC)
     if not imp.empty:
-        print("  Top 15 features:")
-        for feat, score in imp.head(15).items():
+        print("  Top 12 features:")
+        for feat, score in imp.head(12).items():
             bar = "█" * int(score * 300)
-            print(f"    {feat:<45} {score:.4f}  {bar}")
+            print(f"    {feat:<48} {score:.4f}  {bar}")
 
     save_model(final_model)
     return final_model, df, games_raw
 
 
 # ─────────────────────────────────────────────
-# Live scoring
+# Live picks
 # ─────────────────────────────────────────────
 
-def run_live(model, history_features_df: pd.DataFrame):
-    header("today's mlb games — live picks")
+def _build_upcoming_features(upcoming, history_df):
+    """Build a feature dict for each upcoming game."""
+    FC = _feat_module.FEATURE_COLS
+    league_medians = {col: float(history_df[col].median())
+                      for col in FC if col in history_df.columns
+                      and history_df[col].notna().any()}
+    games = []
+    for _, game in upcoming.iterrows():
+        home, away = game["home_team"], game["away_team"]
+        feat = build_game_features(home, away, history_df)
+        feat.update({
+            "game_pk":   int(game.get("game_pk", 0)),
+            "home_team": home,
+            "away_team": away,
+            "home_sp_id":   game.get("home_sp_id"),
+            "home_sp_name": str(game.get("home_sp_name", "TBD")),
+            "away_sp_id":   game.get("away_sp_id"),
+            "away_sp_name": str(game.get("away_sp_name", "TBD")),
+        })
+        games.append(feat)
+    return games
 
-    # Load bankroll from last backtest
+
+def _print_rec(rec, label_width=6):
+    """Print a single bet recommendation row."""
+    tag = {
+        "BET":      "★ BET",
+        "LEAN":     "~ lean",
+        "SKIP":     "skip",
+        "NO_VALUE": "——",
+    }.get(rec.verdict, rec.verdict)
+    edge_s  = f"{'+' if rec.edge >= 0 else ''}{rec.edge*100:.1f}%"
+    stake_s = f"${rec.stake:.2f}" if rec.verdict in ("BET","LEAN") else "——"
+    odds_s  = f"{int(rec.american_odds):+d}"
+
+    if rec.bet_type == "parlay":
+        print(f"\n  ┌─ 3-LEG PARLAY  {odds_s}  Prob:{rec.model_prob*100:.1f}%  "
+              f"Edge:{edge_s}  Stake:{stake_s}  [{tag}]")
+        for leg in rec.bet_side.split("\n    "):
+            print(f"  │  {leg.strip()}")
+        print(f"  └─ Note: {' | '.join(rec.notes)}")
+    elif rec.bet_type == "hr_prop":
+        print(f"  HR PROP  {rec.bet_side:<38} {odds_s:>6}  "
+              f"Edge:{edge_s:>6}  Stake:{stake_s:>8}  [{tag}]")
+    else:
+        type_tag = {"moneyline": "ML  ", "spread": "RL  ", "f5": "F5  "}.get(rec.bet_type,"    ")
+        matchup  = f"{rec.away_team} @ {rec.home_team}"
+        side_s   = f"{rec.bet_side.upper():<12}"
+        print(f"  {type_tag} {matchup:<44} {side_s} {odds_s:>6}  "
+              f"Model:{rec.model_prob*100:>5.1f}%  Fair:{rec.fair_prob*100:>5.1f}%  "
+              f"Edge:{edge_s:>6}  Stake:{stake_s:>8}  [{tag}]")
+        if rec.notes:
+            print(f"        {'':44} {'':12} Note: {' | '.join(rec.notes)}")
+
+
+def run_live(model, history_df):
+    section("today's mlb picks — fliff odds")
+
     bankroll = CONFIG["initial_bankroll"]
-    summary_path = CACHE_DIR / "last_summary.json"
-    if summary_path.exists():
-        with open(summary_path) as f:
+    summ_path = CACHE_DIR / "last_summary.json"
+    if summ_path.exists():
+        with open(summ_path) as f:
             s = json.load(f)
         bankroll = s.get("final_bankroll_kelly", bankroll)
 
-    # Fetch today's schedule
+    FC = _feat_module.FEATURE_COLS
+
+    # ── Fetch schedule & odds ────────────────────────────────────────────
     today_df = fetch_today_schedule()
     if today_df.empty:
-        print("  No MLB games scheduled today.")
+        print("  No MLB games today.")
         return
 
-    # Fetch live odds
-    odds_df = fetch_mlb_odds()
+    odds_df    = fetch_mlb_odds()
+    event_ids  = fetch_event_ids()
+    season     = datetime.now().year
+    game_list  = _build_upcoming_features(today_df, history_df)
 
-    # Match odds to games by team name
-    def match_odds(home, away):
-        if odds_df.empty:
-            return None, None, 0
-        # Try exact match first, then partial
-        mask = (odds_df["home_team"] == home) & (odds_df["away_team"] == away)
-        if not mask.any():
-            mask = odds_df["home_team"].str.contains(home.split()[-1], case=False, na=False) & \
-                   odds_df["away_team"].str.contains(away.split()[-1], case=False, na=False)
-        row = odds_df[mask]
-        if row.empty:
-            return None, None, 0
-        r = row.iloc[0]
-        return r["home_odds_best"], r["away_odds_best"], int(r["n_books"])
+    # ── Prepare output ───────────────────────────────────────────────────
+    all_recs    = []
+    ml_recs     = []
+    hr_all      = []
 
-    # Print table header
     print()
-    col_w = W - 4
-    print(f"  {'MATCHUP':<46} {'SP (HOME)':<22} {'SP (AWAY)':<22} {'ODDS':>6}  {'MODEL':>6}  {'FAIR':>6}  {'EDGE':>6}  {'STAKE':>9}  VERDICT")
-    print(f"  {'─'*col_w}")
+    kv("Bankroll:", f"${bankroll:,.2f}")
+    kv("Min edge:", f"{CONFIG['min_edge']:.0%}")
+    kv("Max stake per bet:", f"{CONFIG['max_stake_pct']:.0%} of bankroll = "
+       f"${bankroll * CONFIG['max_stake_pct']:.2f}")
+    print()
 
-    recs = []
-    for _, game in today_df.iterrows():
-        home = game["home_team"]
-        away = game["away_team"]
-        home_sp_name = str(game.get("home_sp_name", "TBD"))
-        away_sp_name = str(game.get("away_sp_name", "TBD"))
+    for feat in game_list:
+        home = feat["home_team"]
+        away = feat["away_team"]
+        gpk  = feat["game_pk"]
 
-        # Fetch pitcher stats (current season)
-        season = pd.Timestamp.now().year
-        home_sp_stats = {}
-        away_sp_stats = {}
+        model_prob = predict_proba(model, feat, FC)
+
+        # Fetch live SP stats
+        home_sp_stats, away_sp_stats = {}, {}
         try:
-            if game.get("home_sp_id"):
-                home_sp_stats = fetch_pitcher_stats(int(game["home_sp_id"]), season)
+            if feat.get("home_sp_id"):
+                home_sp_stats = fetch_pitcher_stats(int(feat["home_sp_id"]), season) or {}
         except Exception:
             pass
         try:
-            if game.get("away_sp_id"):
-                away_sp_stats = fetch_pitcher_stats(int(game["away_sp_id"]), season)
+            if feat.get("away_sp_id"):
+                away_sp_stats = fetch_pitcher_stats(int(feat["away_sp_id"]), season) or {}
         except Exception:
             pass
 
-        # Build feature vector
-        feat = build_game_features(
-            home_team       = home,
-            away_team       = away,
-            history_df      = history_features_df,
-            home_sp_stats   = home_sp_stats or None,
-            away_sp_stats   = away_sp_stats or None,
-        )
+        home_sp = feat.get("home_sp_name", "TBD")
+        away_sp = feat.get("away_sp_name", "TBD")
 
-        model_prob = predict_proba(model, feat, _feature_cols())
+        # Match odds row
+        def match(df):
+            if df.empty:
+                return None
+            mask = ((df["home_team"] == home) & (df["away_team"] == away))
+            if not mask.any():
+                # fuzzy match on last word of team name
+                mask = (df["home_team"].str.contains(home.split()[-1], case=False, na=False) &
+                        df["away_team"].str.contains(away.split()[-1], case=False, na=False))
+            return df[mask].iloc[0] if mask.any() else None
 
-        # Get odds
-        home_odds, away_odds, n_books = match_odds(home, away)
-
-        if home_odds is None:
-            # No odds available — show model prob only
-            matchup = f"{away} @ {home}"
-            print(f"  {matchup:<46} {home_sp_name:<22} {away_sp_name:<22}  "
-                  f"no odds  Model:{model_prob*100:.1f}%  (no odds available)")
+        odds_row = match(odds_df)
+        if odds_row is None:
+            print(f"  {away} @ {home}  — no FLIFF odds available")
             continue
 
-        rec = evaluate_game(
-            game_pk         = int(game.get("game_pk", 0)),
-            home_team       = home,
-            away_team       = away,
-            home_sp         = home_sp_name,
-            away_sp         = away_sp_name,
-            model_prob_home = model_prob,
-            home_odds       = home_odds,
-            away_odds       = away_odds,
-            bankroll        = bankroll,
-            n_books         = n_books,
-            min_edge        = CONFIG["min_edge"],
-            kelly_frac      = CONFIG["kelly_frac"],
-            max_stake_pct   = CONFIG["max_stake_pct"],
+        n_books = int(odds_row.get("n_books", 1))
+
+        # ── Moneyline ────────────────────────────────────────────────────
+        ml = evaluate_moneyline(
+            game_pk=gpk, home_team=home, away_team=away,
+            home_sp=home_sp, away_sp=away_sp,
+            model_prob_home=model_prob,
+            home_odds=float(odds_row["home_odds"]),
+            away_odds=float(odds_row["away_odds"]),
+            initial_bankroll=bankroll,
+            n_books=n_books, min_edge=CONFIG["min_edge"],
+            kelly_frac=CONFIG["kelly_frac"],
+            max_stake_pct=CONFIG["max_stake_pct"],
         )
-        recs.append(rec)
+        ml_recs.append(ml)
+        all_recs.append(ml)
 
-        # Format output row
-        matchup    = f"{away} @ {home}"
-        odds_str   = f"{int(rec.american_odds):>+d}"
-        edge_str   = f"{'+'if rec.edge>=0 else''}{rec.edge*100:.1f}%"
-        stake_str  = f"${rec.stake:>8.2f}" if rec.verdict in ("BET","LEAN") else f"{'—':>9}"
-        model_str  = f"{model_prob*100:.1f}%"
-        fair_str   = f"{rec.fair_prob*100:.1f}%"
-        verdict_tag = {
-            "BET":      "★ BET ★",
-            "LEAN":     "~ lean ~",
-            "SKIP":     "skip",
-            "NO_VALUE": "no edge",
-        }.get(rec.verdict, rec.verdict)
+        # ── Run line ─────────────────────────────────────────────────────
+        if pd.notna(odds_row.get("rl_home_odds")):
+            rl = evaluate_spread(
+                game_pk=gpk, home_team=home, away_team=away,
+                home_sp=home_sp, away_sp=away_sp,
+                model_prob_home=model_prob,
+                rl_home_line=float(odds_row["rl_home_line"]),
+                rl_home_odds=float(odds_row["rl_home_odds"]),
+                rl_away_line=float(odds_row["rl_away_line"]),
+                rl_away_odds=float(odds_row["rl_away_odds"]),
+                initial_bankroll=bankroll,
+                min_edge=CONFIG["min_edge"],
+                kelly_frac=CONFIG["kelly_frac"],
+                max_stake_pct=CONFIG["max_stake_pct"],
+            )
+            if rl:
+                all_recs.append(rl)
 
-        print(f"  {matchup:<46} {home_sp_name:<22} {away_sp_name:<22} "
-              f"{odds_str:>6}  {model_str:>6}  {fair_str:>6}  {edge_str:>6}  {stake_str}  {verdict_tag}")
+        # ── First 5 innings ──────────────────────────────────────────────
+        if pd.notna(odds_row.get("f5_home_odds")):
+            f5 = evaluate_f5(
+                game_pk=gpk, home_team=home, away_team=away,
+                home_sp=home_sp, away_sp=away_sp,
+                model_prob_home=model_prob,
+                f5_home_odds=float(odds_row["f5_home_odds"]),
+                f5_away_odds=float(odds_row["f5_away_odds"]),
+                home_sp_stats=home_sp_stats,
+                away_sp_stats=away_sp_stats,
+                initial_bankroll=bankroll,
+                min_edge=CONFIG["min_edge"],
+                kelly_frac=CONFIG["kelly_frac"],
+                max_stake_pct=CONFIG["max_stake_pct"],
+            )
+            if f5:
+                all_recs.append(f5)
 
-        if rec.notes:
-            print(f"  {'':46} {'':22} {'':22}  Note: {' | '.join(rec.notes)}")
+        # ── HR props ─────────────────────────────────────────────────────
+        event_id = event_ids.get((home, away))
+        if event_id:
+            hr_df = fetch_hr_props(event_id)
+            hr_recs = evaluate_hr_props(
+                hr_df=hr_df, game_pk=gpk,
+                home_team=home, away_team=away,
+                initial_bankroll=bankroll,
+                min_edge=0.05,
+                kelly_frac=0.15,
+                max_stake_pct=0.02,
+            )
+            hr_all.extend(hr_recs)
+            all_recs.extend(hr_recs)
 
-    # Summary footer
-    print(f"  {'─'*col_w}")
-    bets_flagged = sum(1 for r in recs if r.verdict == "BET")
-    leans = sum(1 for r in recs if r.verdict == "LEAN")
-    total_stake = sum(r.stake for r in recs if r.verdict in ("BET","LEAN"))
-    print()
-    kv("Games evaluated:", len(recs))
-    kv("Bets flagged (★ BET ★):", bets_flagged)
-    kv("Leans flagged:", leans)
-    kv("Total stake today:", f"${total_stake:,.2f}")
-    kv("Bankroll:", f"${bankroll:,.2f}")
+    # ── 3-leg parlay ─────────────────────────────────────────────────────
+    parlay = build_parlay(ml_recs, bankroll,
+                          kelly_frac=0.10, max_stake_pct=0.02)
+    if parlay:
+        all_recs.append(parlay)
 
-    if bets_flagged == 0 and leans == 0:
+    # ── Print results ─────────────────────────────────────────────────────
+    section("moneyline picks")
+    ml_actionable = [r for r in ml_recs if r.verdict in ("BET","LEAN")]
+    if ml_actionable:
+        for r in sorted(ml_actionable, key=lambda x: x.edge, reverse=True):
+            _print_rec(r)
+    else:
+        print("  No moneyline value found today.")
+
+    section("run line picks")
+    rl_recs = [r for r in all_recs
+               if r.bet_type == "spread" and r.verdict in ("BET","LEAN")]
+    if rl_recs:
+        for r in sorted(rl_recs, key=lambda x: x.edge, reverse=True):
+            _print_rec(r)
+    else:
+        print("  No run line value found today.")
+
+    section("first 5 innings picks")
+    f5_recs = [r for r in all_recs
+               if r.bet_type == "f5" and r.verdict in ("BET","LEAN")]
+    if f5_recs:
+        for r in sorted(f5_recs, key=lambda x: x.edge, reverse=True):
+            _print_rec(r)
+    else:
+        print("  No F5 value found today.")
+
+    section("3-leg parlay recommendation")
+    if parlay and parlay.verdict == "BET":
+        _print_rec(parlay)
+    elif parlay:
+        print(f"  Parlay built but verdict is {parlay.verdict} "
+              f"(edge {parlay.edge*100:.1f}% — below threshold).")
+        _print_rec(parlay)
+    else:
+        print("  Need at least 3 qualifying moneyline picks to build a parlay.")
+
+    section("home run props")
+    hr_actionable = [r for r in hr_all if r.verdict == "BET"]
+    if hr_actionable:
+        print(f"  {'PLAYER':<35} {'ODDS':>6}  {'MODEL':>7}  "
+              f"{'FAIR':>7}  {'EDGE':>6}  {'STAKE':>8}  VERDICT")
+        div()
+        for r in sorted(hr_actionable, key=lambda x: x.edge, reverse=True)[:5]:
+            _print_rec(r)
+    else:
+        print("  No HR prop value found today "
+              "(FLIFF may not carry batter_home_runs or all priced fairly).")
+
+    # ── Summary ───────────────────────────────────────────────────────────
+    section("daily summary")
+    bets = [r for r in all_recs if r.verdict == "BET"]
+    leans = [r for r in all_recs if r.verdict == "LEAN"]
+    total_stake = sum(r.stake for r in bets + leans)
+    kv("Games evaluated:",    len(set(r.game_pk for r in all_recs if r.game_pk > 0)))
+    kv("Bets flagged (★):",   len(bets))
+    kv("Leans flagged (~):",  len(leans))
+    kv("Total stake today:",  f"${total_stake:.2f}")
+    kv("Bankroll:",           f"${bankroll:,.2f}")
+    kv("Max single stake:",   f"${bankroll * CONFIG['max_stake_pct']:.2f} "
+                              f"({CONFIG['max_stake_pct']:.0%} cap)")
+
+    if not bets and not leans:
         print()
-        print("  No value found today. That's fine — discipline beats forcing bets.")
+        print("  No value found today — discipline beats forcing bets.")
 
 
 # ─────────────────────────────────────────────
@@ -431,25 +563,27 @@ def run_live(model, history_features_df: pd.DataFrame):
 def main():
     parser = argparse.ArgumentParser(description="MLB Betting Model")
     parser.add_argument("--mode",     choices=["train","live","both"], default="both")
-    parser.add_argument("--seasons",  nargs="+", type=int, default=CONFIG["seasons"])
+    parser.add_argument("--seasons",  nargs="+", type=int, default=None)
     parser.add_argument("--bankroll", type=float, default=None)
     parser.add_argument("--min-edge", type=float, default=None)
     parser.add_argument("--kelly",    type=float, default=None)
     args = parser.parse_args()
 
-    if args.bankroll: CONFIG["initial_bankroll"] = args.bankroll
-    if args.min_edge: CONFIG["min_edge"]         = args.min_edge
-    if args.kelly:    CONFIG["kelly_frac"]       = args.kelly
-    if args.seasons:  CONFIG["seasons"]          = args.seasons
+    if args.bankroll:  CONFIG["initial_bankroll"] = args.bankroll
+    if args.min_edge:  CONFIG["min_edge"]         = args.min_edge
+    if args.kelly:     CONFIG["kelly_frac"]       = args.kelly
+    if args.seasons:   CONFIG["seasons"]          = args.seasons
 
     print(f"\n{'═'*W}")
     print(f"  MLB BETTING MODEL")
     print(f"{'═'*W}")
-    kv("Mode:",       args.mode)
-    kv("Seasons:",    ", ".join(str(s) for s in CONFIG["seasons"]))
-    kv("Bankroll:",   f"${CONFIG['initial_bankroll']:,.2f}")
-    kv("Min edge:",   f"{CONFIG['min_edge']:.0%}")
-    kv("Kelly frac:", f"{CONFIG['kelly_frac']:.0%}")
+    kv("Mode:",         args.mode)
+    kv("Seasons:",      ", ".join(str(s) for s in CONFIG["seasons"]))
+    kv("Bankroll:",     f"${CONFIG['initial_bankroll']:,.2f}")
+    kv("Min edge:",     f"{CONFIG['min_edge']:.0%}")
+    kv("Kelly frac:",   f"{CONFIG['kelly_frac']:.0%}")
+    kv("Max stake:",    f"{CONFIG['max_stake_pct']:.0%} per bet  "
+                        f"= ${CONFIG['initial_bankroll'] * CONFIG['max_stake_pct']:.2f}")
 
     model = None
     history_df = None
@@ -464,15 +598,16 @@ def main():
                 print("  No saved model — run with --mode train first.")
                 return
         if history_df is None:
-            games_raw = load_games(CONFIG["seasons"])
-            games_raw = load_odds_for_history(games_raw)
+            games_raw  = load_games(CONFIG["seasons"])
+            games_raw  = load_odds_for_history(games_raw)
             team_stats = load_team_stats(CONFIG["seasons"])
-            history_df = build_features(games_raw, team_stats)
+            history_df = build_features(
+                games_raw,
+                team_stats if not team_stats.empty else None
+            )
         run_live(model, history_df)
 
-    print(f"\n{'═'*W}")
-    print("  DONE")
-    print(f"{'═'*W}\n")
+    print(f"\n{'═'*W}\n  DONE\n{'═'*W}\n")
 
 
 if __name__ == "__main__":
