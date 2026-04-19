@@ -31,6 +31,8 @@ from mlb_data import (
     fetch_today_schedule, fetch_mlb_odds,
     fetch_pitcher_stats, fetch_lineup_stats,
     fetch_hr_props, fetch_event_ids,
+    fetch_pitcher_hand, fetch_batter_hand,
+    fetch_weather, get_hr_park_factor,
     clear_corrupted_cache,
 )
 from mlb_features import build_features, build_game_features, TARGET_COL
@@ -40,7 +42,7 @@ from mlb_model import (
     save_model, load_model, predict_proba, get_feature_importance,
 )
 from mlb_betting import (
-    evaluate_moneyline, evaluate_spread, evaluate_f5,
+    evaluate_moneyline, evaluate_spread,
     evaluate_hr_props, build_parlay,
     run_backtest, edge_buckets, monthly_performance,
     american_to_decimal,
@@ -332,14 +334,26 @@ def _print_rec(rec, label_width=6):
         print(f"  HR PROP  {rec.bet_side:<38} {odds_s:>6}  "
               f"Edge:{edge_s:>6}  Stake:{stake_s:>8}  [{tag}]")
     else:
-        type_tag = {"moneyline": "ML  ", "spread": "RL  ", "f5": "F5  "}.get(rec.bet_type,"    ")
+        type_tag = {"moneyline": "ML", "spread": "RL"}.get(rec.bet_type, rec.bet_type.upper())
         matchup  = f"{rec.away_team} @ {rec.home_team}"
-        side_s   = f"{rec.bet_side.upper():<12}"
-        print(f"  {type_tag} {matchup:<44} {side_s} {odds_s:>6}  "
+        # Resolve bet_side ("home"/"away") to actual team name
+        if rec.bet_side in ("home", "home -1.5"):
+            pick = rec.home_team
+            line = "" if rec.bet_type == "moneyline" else " -1.5"
+        elif rec.bet_side in ("away", "away +1.5"):
+            pick = rec.away_team
+            line = "" if rec.bet_type == "moneyline" else " +1.5"
+        else:
+            # spread side stored as e.g. "home -1.5" or "away +1.5"
+            parts = rec.bet_side.split()
+            pick  = rec.home_team if parts[0] == "home" else rec.away_team
+            line  = " " + " ".join(parts[1:]) if len(parts) > 1 else ""
+        pick_s = f"{pick}{line}"
+        print(f"  {type_tag:<4} {matchup:<44}  PICK: {pick_s:<28} {odds_s:>6}  "
               f"Model:{rec.model_prob*100:>5.1f}%  Fair:{rec.fair_prob*100:>5.1f}%  "
               f"Edge:{edge_s:>6}  Stake:{stake_s:>8}  [{tag}]")
         if rec.notes:
-            print(f"        {'':44} {'':12} Note: {' | '.join(rec.notes)}")
+            print(f"       {'':44}  {'':35} Note: {' | '.join(rec.notes)}")
 
 
 def run_live(model, history_df):
@@ -448,40 +462,53 @@ def run_live(model, history_df):
             if rl:
                 all_recs.append(rl)
 
-        # ── First 5 innings ──────────────────────────────────────────────
-        # The Odds API does not offer a separate F5 market for MLB.
-        # We evaluate F5 using the full-game moneyline odds adjusted by
-        # the SP ERA differential. This gives a fair F5 probability estimate.
-        f5 = evaluate_f5(
-            game_pk=gpk, home_team=home, away_team=away,
-            home_sp=home_sp, away_sp=away_sp,
-            model_prob_home=model_prob,
-            f5_home_odds=float(odds_row["home_odds"]),   # use ML odds as base
-            f5_away_odds=float(odds_row["away_odds"]),
-            home_sp_stats=home_sp_stats,
-            away_sp_stats=away_sp_stats,
-            initial_bankroll=bankroll,
-            min_edge=CONFIG["min_edge"],
-            kelly_frac=CONFIG["kelly_frac"],
-            max_stake_pct=CONFIG["max_stake_pct"],
-        )
-        if f5:
-            all_recs.append(f5)
+
 
         # ── HR props ─────────────────────────────────────────────────────
         event_id = event_ids.get((home, away))
         if event_id:
             hr_df = fetch_hr_props(event_id)
-            hr_recs = evaluate_hr_props(
-                hr_df=hr_df, game_pk=gpk,
-                home_team=home, away_team=away,
-                initial_bankroll=bankroll,
-                min_edge=0.05,
-                kelly_frac=0.15,
-                max_stake_pct=0.02,
-            )
-            hr_all.extend(hr_recs)
-            all_recs.extend(hr_recs)
+
+            # Enrich hr_df with batter handedness
+            if not hr_df.empty and "batter_id" in hr_df.columns:
+                hr_df["bats"] = hr_df["batter_id"].apply(
+                    lambda bid: fetch_batter_hand(int(bid)) if pd.notna(bid) else "R"
+                )
+            elif not hr_df.empty and "bats" not in hr_df.columns:
+                hr_df["bats"] = "R"   # default if ID not available
+
+            # Opposing pitcher handedness (home batters face away SP, vice versa)
+            home_sp_hand = fetch_pitcher_hand(feat.get("away_sp_id")) if feat.get("away_sp_id") else "R"
+            away_sp_hand = fetch_pitcher_hand(feat.get("home_sp_id")) if feat.get("home_sp_id") else "R"
+
+            # Weather for this ballpark
+            weather = fetch_weather(home)
+            hr_park = get_hr_park_factor(home)
+
+            # Evaluate home batters (face away SP) and away batters (face home SP)
+            for batter_side, opp_hand in [("home", home_sp_hand), ("away", away_sp_hand)]:
+                side_hr_df = hr_df[hr_df.get("team", pd.Series(["both"]*len(hr_df))) != (
+                    "away" if batter_side == "home" else "home"
+                )].copy() if "team" in hr_df.columns else hr_df.copy()
+
+                hr_recs = evaluate_hr_props(
+                    hr_df            = side_hr_df,
+                    game_pk          = gpk,
+                    home_team        = home,
+                    away_team        = away,
+                    initial_bankroll = bankroll,
+                    pitcher_hand     = opp_hand,
+                    park_factor      = hr_park,
+                    wind_mph         = weather.get("wind_mph", 0.0),
+                    wind_dir         = weather.get("wind_dir", ""),
+                    temp_f           = weather.get("temp_f", 72.0),
+                    home_game        = (batter_side == "home"),
+                    min_edge         = 0.04,
+                    kelly_frac       = 0.15,
+                    max_stake_pct    = 0.02,
+                )
+                hr_all.extend(hr_recs)
+                all_recs.extend(hr_recs)
 
     # ── 3-leg parlay ─────────────────────────────────────────────────────
     parlay = build_parlay(ml_recs, bankroll,
@@ -507,15 +534,6 @@ def run_live(model, history_df):
     else:
         print("  No run line value found today.")
 
-    section("first 5 innings picks")
-    f5_recs = [r for r in all_recs
-               if r.bet_type == "f5" and r.verdict in ("BET","LEAN")]
-    if f5_recs:
-        for r in sorted(f5_recs, key=lambda x: x.edge, reverse=True):
-            _print_rec(r)
-    else:
-        print("  No F5 value found today.")
-
     section("3-leg parlay recommendation")
     if parlay and parlay.verdict == "BET":
         _print_rec(parlay)
@@ -528,15 +546,25 @@ def run_live(model, history_df):
 
     section("home run props")
     hr_actionable = [r for r in hr_all if r.verdict == "BET"]
-    if hr_actionable:
-        print(f"  {'PLAYER':<35} {'ODDS':>6}  {'MODEL':>7}  "
-              f"{'FAIR':>7}  {'EDGE':>6}  {'STAKE':>8}  VERDICT")
+    # Deduplicate same player appearing from home/away loop
+    seen_hr, hr_unique = set(), []
+    for r in sorted(hr_actionable, key=lambda x: x.edge, reverse=True):
+        if r.bet_side not in seen_hr:
+            seen_hr.add(r.bet_side)
+            hr_unique.append(r)
+    if hr_unique:
+        print(f"  {'PLAYER / BET':<42}  {'OPP':<5}  {'ODDS':>6}  "
+              f"{'MODEL':>7}  {'EDGE':>6}  {'STAKE':>8}  VERDICT")
         div()
-        for r in sorted(hr_actionable, key=lambda x: x.edge, reverse=True)[:5]:
-            _print_rec(r)
+        for r in hr_unique[:6]:
+            opp = r.home_sp if r.home_sp else "?"
+            print(f"  {r.bet_side:<42}  {opp:<5}  {int(r.american_odds):>+6}  "
+                  f"{r.model_prob*100:>6.1f}%  {r.edge*100:>+5.1f}%  "
+                  f"${r.stake:>7.2f}  [BET]")
+            print(f"    Factors: {' | '.join(r.notes)}")
     else:
-        print("  No HR prop value found today "
-              "(FLIFF may not carry batter_home_runs or all priced fairly).")
+        print("  No HR prop value found today.")
+        print("  (Odds API may not carry batter_home_runs, or all lines priced fairly)")
 
     # ── Summary ───────────────────────────────────────────────────────────
     section("daily summary")

@@ -618,3 +618,195 @@ def compute_h2h(schedule_df, window_games=20):
     for (home, away), games in df.groupby(["home_team", "away_team"]):
         h2h[(home, away)] = games.tail(window_games)["home_win"].mean()
     return h2h
+
+
+# ─────────────────────────────────────────────
+# Pitcher handedness
+# ─────────────────────────────────────────────
+
+def fetch_pitcher_hand(pitcher_id: int) -> str:
+    """
+    Returns 'R', 'L', or 'R' (default) for a pitcher.
+    Uses the MLB People endpoint which includes pitchHand.
+    """
+    if not pitcher_id:
+        return "R"
+    try:
+        data = _mlb(
+            f"people/{pitcher_id}",
+            cache_key=f"person_{pitcher_id}",
+            cache_ttl_mins=43200,   # 30 days — handedness never changes
+        )
+        people = data.get("people", [])
+        if people:
+            return people[0].get("pitchHand", {}).get("code", "R")
+    except Exception:
+        pass
+    return "R"
+
+
+def fetch_batter_hand(player_id: int) -> str:
+    """Returns 'R', 'L', or 'S' (switch) for a batter."""
+    if not player_id:
+        return "R"
+    try:
+        data = _mlb(
+            f"people/{player_id}",
+            cache_key=f"person_{player_id}",
+            cache_ttl_mins=43200,
+        )
+        people = data.get("people", [])
+        if people:
+            return people[0].get("batSide", {}).get("code", "R")
+    except Exception:
+        pass
+    return "R"
+
+
+# ─────────────────────────────────────────────
+# Weather data (wttr.in — free, no key needed)
+# ─────────────────────────────────────────────
+
+# Ballpark city lookup for weather queries
+BALLPARK_CITIES = {
+    "Arizona Diamondbacks":    "Phoenix, AZ",
+    "Atlanta Braves":          "Cumberland, GA",
+    "Baltimore Orioles":       "Baltimore, MD",
+    "Boston Red Sox":          "Boston, MA",
+    "Chicago Cubs":            "Chicago, IL",
+    "Chicago White Sox":       "Chicago, IL",
+    "Cincinnati Reds":         "Cincinnati, OH",
+    "Cleveland Guardians":     "Cleveland, OH",
+    "Colorado Rockies":        "Denver, CO",
+    "Detroit Tigers":          "Detroit, MI",
+    "Houston Astros":          "Houston, TX",
+    "Kansas City Royals":      "Kansas City, MO",
+    "Los Angeles Angels":      "Anaheim, CA",
+    "Los Angeles Dodgers":     "Los Angeles, CA",
+    "Miami Marlins":           "Miami, FL",
+    "Milwaukee Brewers":       "Milwaukee, WI",
+    "Minnesota Twins":         "Minneapolis, MN",
+    "New York Mets":           "New York, NY",
+    "New York Yankees":        "New York, NY",
+    "Oakland Athletics":       "Oakland, CA",
+    "Philadelphia Phillies":   "Philadelphia, PA",
+    "Pittsburgh Pirates":      "Pittsburgh, PA",
+    "San Diego Padres":        "San Diego, CA",
+    "San Francisco Giants":    "San Francisco, CA",
+    "Seattle Mariners":        "Seattle, WA",
+    "St. Louis Cardinals":     "St. Louis, MO",
+    "Tampa Bay Rays":          "St. Petersburg, FL",
+    "Texas Rangers":           "Arlington, TX",
+    "Toronto Blue Jays":       "Toronto, ON",
+    "Washington Nationals":    "Washington, DC",
+}
+
+# Parks that are fully domed/retractable and weather-neutral when closed
+INDOOR_PARKS = {
+    "Tampa Bay Rays",        # Tropicana Field — fixed dome
+    "Arizona Diamondbacks",  # Chase Field — retractable
+    "Houston Astros",        # Minute Maid — retractable
+    "Seattle Mariners",      # T-Mobile Park — retractable
+    "Toronto Blue Jays",     # Rogers Centre — retractable
+    "Milwaukee Brewers",     # American Family Field — retractable
+    "Minnesota Twins",       # Target Field — open air but retractable roof
+    "Miami Marlins",         # loanDepot park — retractable
+}
+
+# Ballpark HR park factors (2022-24 average, relative to 1.00 = neutral)
+# Source: Baseball Reference multi-year park factors for HR specifically
+HR_PARK_FACTORS = {
+    "Colorado Rockies":       1.35,
+    "Cincinnati Reds":        1.22,
+    "New York Yankees":       1.18,
+    "Philadelphia Phillies":  1.14,
+    "Texas Rangers":          1.12,
+    "Boston Red Sox":         1.10,
+    "Atlanta Braves":         1.08,
+    "Baltimore Orioles":      1.07,
+    "Chicago Cubs":           1.06,
+    "Toronto Blue Jays":      1.05,
+    "Minnesota Twins":        1.04,
+    "Cleveland Guardians":    1.02,
+    "Kansas City Royals":     1.01,
+    "Los Angeles Angels":     1.00,
+    "Washington Nationals":   1.00,
+    "Detroit Tigers":         0.99,
+    "St. Louis Cardinals":    0.98,
+    "New York Mets":          0.97,
+    "Pittsburgh Pirates":     0.97,
+    "Chicago White Sox":      0.96,
+    "Los Angeles Dodgers":    0.95,
+    "Houston Astros":         0.95,
+    "Oakland Athletics":      0.94,
+    "San Francisco Giants":   0.93,
+    "Milwaukee Brewers":      0.93,
+    "San Diego Padres":       0.92,
+    "Seattle Mariners":       0.91,
+    "Arizona Diamondbacks":   0.90,
+    "Miami Marlins":          0.89,
+    "Tampa Bay Rays":         0.88,
+}
+
+
+def get_hr_park_factor(home_team: str) -> float:
+    return HR_PARK_FACTORS.get(home_team, 1.00)
+
+
+def fetch_weather(home_team: str) -> dict:
+    """
+    Fetch current weather for the ballpark city using wttr.in (free, no key).
+    Returns dict with temp_f, wind_mph, wind_dir, condition.
+    Falls back to neutral defaults if the request fails or park is indoors.
+    """
+    neutral = {"temp_f": 72.0, "wind_mph": 0.0, "wind_dir": "", "condition": "unknown", "indoor": False}
+
+    if home_team in INDOOR_PARKS:
+        return {**neutral, "indoor": True, "condition": "indoor"}
+
+    city = BALLPARK_CITIES.get(home_team, "")
+    if not city:
+        return neutral
+
+    try:
+        resp = requests.get(
+            "https://wttr.in/" + city.replace(" ", "+").replace(",", ""),
+            params={"format": "j1"},
+            timeout=8,
+            headers={"User-Agent": "mlb-betting-model/1.0"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        current = data["current_condition"][0]
+        temp_f  = float(current.get("temp_F", 72))
+        wind_mph = float(current.get("windspeedMiles", 0))
+
+        # Wind direction: convert degrees to category
+        wind_deg = float(current.get("winddirDegree", 0))
+        # We don't know batter orientation per park so use speed only;
+        # stadium orientation would need a separate lookup
+        wind_dir = _wind_dir_label(wind_deg)
+
+        condition = current.get("weatherDesc", [{}])[0].get("value", "")
+
+        return {
+            "temp_f":    temp_f,
+            "wind_mph":  wind_mph,
+            "wind_dir":  wind_dir,
+            "condition": condition,
+            "indoor":    False,
+        }
+    except Exception:
+        return neutral
+
+
+def _wind_dir_label(degrees: float) -> str:
+    """Convert wind degrees to 'out'/'in'/'cross' using rough stadium orientation."""
+    # Without per-park orientation data we return the compass direction;
+    # the HR model treats unknown direction as neutral (wind_adj = 0)
+    if degrees is None:
+        return ""
+    dirs = ["N","NE","E","SE","S","SW","W","NW"]
+    idx = round(degrees / 45) % 8
+    return dirs[idx]

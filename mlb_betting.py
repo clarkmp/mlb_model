@@ -16,7 +16,6 @@ Bet types supported
 ───────────────────
   moneyline  — standard h2h win bet
   spread     — run line (-1.5 / +1.5)
-  f5         — first 5 innings moneyline
   parlay     — 3-leg combo of the top moneyline edges
   hr_prop    — batter HR over (0.5 line)
 """
@@ -99,7 +98,7 @@ class BetRecommendation:
     away_team:     str
     home_sp:       str
     away_sp:       str
-    bet_type:      str    # moneyline | spread | f5 | parlay | hr_prop
+    bet_type:      str    # moneyline | spread | parlay | hr_prop
     bet_side:      str    # home | away | over | parlay description
     model_prob:    float
     fair_prob:     float
@@ -259,107 +258,71 @@ def evaluate_spread(
     )
 
 
-# ─────────────────────────────────────────────
-# First 5 innings evaluation
-# ─────────────────────────────────────────────
-
-def evaluate_f5(
-    game_pk:         int,
-    home_team:       str,
-    away_team:       str,
-    home_sp:         str,
-    away_sp:         str,
-    model_prob_home: float,
-    f5_home_odds:    float,
-    f5_away_odds:    float,
-    home_sp_stats:   dict,
-    away_sp_stats:   dict,
-    initial_bankroll: float,
-    min_edge:        float = 0.04,
-    kelly_frac:      float = 0.25,
-    max_stake_pct:   float = 0.03,
-) -> Optional[BetRecommendation]:
-    """
-    F5 bet evaluation. SP quality is the dominant factor for 5-inning results.
-    We adjust the full-game model probability using relative SP ERA.
-    """
-    if f5_home_odds is None or f5_away_odds is None:
-        return None
-
-    # SP ERA adjustment: better SP → higher F5 win probability
-    home_era = (home_sp_stats or {}).get("era", 4.50)
-    away_era = (away_sp_stats or {}).get("era", 4.50)
-    era_diff  = away_era - home_era    # positive = home SP advantage
-
-    # Logistic shift: each ERA point of advantage ~ 3pp probability shift
-    era_adj  = np.tanh(era_diff / 3.0) * 0.08
-    p_f5_home = np.clip(model_prob_home + era_adj, 0.20, 0.80)
-    p_f5_away = 1.0 - p_f5_home
-
-    fair_h, fair_a = remove_vig(f5_home_odds, f5_away_odds)
-    vig = vig_pct(f5_home_odds, f5_away_odds)
-
-    edge_h = p_f5_home - fair_h
-    edge_a = p_f5_away - fair_a
-
-    if edge_h >= edge_a:
-        side, mp, fp, edge, am = "home", p_f5_home, fair_h, edge_h, f5_home_odds
-    else:
-        side, mp, fp, edge, am = "away", p_f5_away, fair_a, edge_a, f5_away_odds
-
-    dec   = american_to_decimal(am)
-    stake = kelly_stake(mp, dec, initial_bankroll, kelly_frac, max_stake_pct)
-
-    if edge >= min_edge and stake > 0:
-        verdict = "BET"
-    elif edge >= min_edge * 0.6 and stake > 0:
-        verdict = "LEAN"
-    elif edge > 0:
-        verdict = "SKIP"
-    else:
-        verdict = "NO_VALUE"
-
-    sp_note = f"SPs: {home_sp} ERA {home_era:.2f} vs {away_sp} ERA {away_era:.2f}"
-
-    return BetRecommendation(
-        game_pk=game_pk, home_team=home_team, away_team=away_team,
-        home_sp=home_sp, away_sp=away_sp,
-        bet_type="f5", bet_side=side,
-        model_prob=round(mp, 4), fair_prob=round(fp, 4),
-        edge=round(edge, 4),
-        american_odds=am, decimal_odds=round(dec, 4),
-        vig=round(vig, 4), n_books=1,
-        kelly_pct=round(stake / initial_bankroll, 4),
-        stake=stake, bankroll=initial_bankroll,
-        verdict=verdict, confidence="MEDIUM",
-        notes=[sp_note],
-    )
-
 
 # ─────────────────────────────────────────────
 # Home run prop evaluation
 # ─────────────────────────────────────────────
 
 def evaluate_hr_props(
-    hr_df:           pd.DataFrame,
-    game_pk:         int,
-    home_team:       str,
-    away_team:       str,
+    hr_df:            pd.DataFrame,
+    game_pk:          int,
+    home_team:        str,
+    away_team:        str,
     initial_bankroll: float,
-    min_edge:        float = 0.05,   # slightly tighter for props
-    kelly_frac:      float = 0.15,   # more conservative on props
-    max_stake_pct:   float = 0.02,
-) -> list[BetRecommendation]:
+    pitcher_hand:     str   = "R",    # opposing pitcher handedness: "R" or "L"
+    park_factor:      float = 1.00,   # ballpark HR factor (>1 = hitter friendly)
+    wind_mph:         float = 0.0,    # positive = blowing out (favours HRs)
+    wind_dir:         str   = "",     # "out", "in", "cross", ""
+    temp_f:           float = 72.0,   # game-time temperature (warmer = more HRs)
+    home_game:        bool  = True,   # is batter playing at home?
+    min_edge:         float = 0.04,
+    kelly_frac:       float = 0.15,
+    max_stake_pct:    float = 0.02,
+) -> list['BetRecommendation']:
     """
-    Evaluate HR over props. League-average HR rate per PA is ~3.5%.
-    Over a full game (~4 PA) that's ~13% per player.
-    We flag any player where the implied probability is below 12%
-    (i.e. the line is priced better than fair).
+    Multi-factor HR over prop evaluation.
+
+    Factors modelled:
+      - Pitcher handedness vs batter platoon advantage
+          RHB vs LHP: +15% HR rate uplift (batters hit more HRs vs opposite hand)
+          LHB vs RHP: +10% uplift
+          Same-hand matchup: -5% suppression
+      - Ballpark HR factor (park_factor from Baseball Reference)
+          Coors (1.35), Yankee Stadium (1.18), Fenway (0.88), etc.
+      - Wind: blowing out at >10mph adds ~8% per 5mph increment
+      - Temperature: ball carries further in heat — +1% per 5°F above 72°F
+      - Home/road: marginal comfort edge (~+2% at home)
+
+    Base HR probability: 13% per starting position player per game
+    (league avg ~0.035 HR/PA × ~3.8 PA/game ≈ 13.3%)
     """
     if hr_df is None or hr_df.empty:
         return []
 
-    LEAGUE_HR_PROB = 0.130   # ~13% chance any starter hits a HR per game
+    # ── Base rate ──────────────────────────────────────────────────────────
+    BASE_HR_PROB = 0.133
+
+    # ── Pitcher handedness adjustment ──────────────────────────────────────
+    # Platoon splits from 2022-24 Statcast aggregate
+    ph = pitcher_hand.upper() if pitcher_hand else "R"
+
+    # ── Environmental adjustments ──────────────────────────────────────────
+    # Park factor: normalised so 1.00 = neutral
+    park_adj = (park_factor - 1.0) * 0.6    # scale: Coors 1.35 → +21%
+
+    # Wind: each 5mph blowing out adds ~4pp; blowing in subtracts
+    if "out" in wind_dir.lower():
+        wind_adj = max(0, wind_mph - 5) / 5 * 0.04
+    elif "in" in wind_dir.lower():
+        wind_adj = -max(0, wind_mph - 5) / 5 * 0.03
+    else:
+        wind_adj = 0.0                       # cross wind or unknown
+
+    # Temperature: ball travels ~3% further per 10°F above 70°F
+    temp_adj = max(0, temp_f - 72) / 5 * 0.01
+
+    # Home comfort edge
+    home_adj = 0.02 if home_game else 0.0
 
     recs = []
     for _, row in hr_df.iterrows():
@@ -367,37 +330,72 @@ def evaluate_hr_props(
         if over_odds is None:
             continue
 
-        dec       = american_to_decimal(float(over_odds))
-        implied_p = 1.0 / dec          # raw implied (no vig removal — single line)
-        edge      = LEAGUE_HR_PROB - implied_p
+        # ── Platoon adjustment per batter ────────────────────────────────
+        bats = str(row.get("bats", "R")).upper()   # batter handedness
+        if bats == "S":
+            # Switch hitter: always has platoon advantage
+            platoon_adj = 0.08
+        elif bats != ph:
+            # Opposite hand: batter has advantage
+            platoon_adj = 0.12 if bats == "R" else 0.08
+        else:
+            # Same hand: pitcher has advantage
+            platoon_adj = -0.05
+
+        # ── Composite model probability ──────────────────────────────────
+        model_p = BASE_HR_PROB * (
+            1.0 + platoon_adj + park_adj + wind_adj + temp_adj + home_adj
+        )
+        model_p = float(np.clip(model_p, 0.04, 0.45))
+
+        dec      = american_to_decimal(float(over_odds))
+        implied_p = 1.0 / dec
+        edge     = model_p - implied_p
 
         if edge < min_edge:
             continue
 
-        stake = kelly_stake(LEAGUE_HR_PROB, dec, initial_bankroll,
+        stake = kelly_stake(model_p, dec, initial_bankroll,
                             kelly_frac, max_stake_pct)
 
+        # Build a readable notes string explaining the factors
+        factor_notes = []
+        if abs(platoon_adj) > 0.01:
+            direction = "advantage" if platoon_adj > 0 else "disadvantage"
+            factor_notes.append(f"{bats}HB vs {ph}HP platoon {direction} ({platoon_adj:+.0%})")
+        if abs(park_adj) > 0.01:
+            factor_notes.append(f"park {park_adj:+.0%}")
+        if abs(wind_adj) > 0.005:
+            factor_notes.append(f"wind {wind_mph:.0f}mph {wind_dir} ({wind_adj:+.0%})")
+        if abs(temp_adj) > 0.005:
+            factor_notes.append(f"{temp_f:.0f}°F ({temp_adj:+.0%})")
+        if not factor_notes:
+            factor_notes.append("neutral conditions")
+
         recs.append(BetRecommendation(
-            game_pk=game_pk,
-            home_team=home_team, away_team=away_team,
-            home_sp="", away_sp="",
-            bet_type="hr_prop",
-            bet_side=f"{row['player']} HR Over {row.get('line', 0.5)}",
-            model_prob=LEAGUE_HR_PROB,
-            fair_prob=implied_p,
-            edge=round(edge, 4),
-            american_odds=float(over_odds),
-            decimal_odds=round(dec, 4),
-            vig=0.0, n_books=1,
-            kelly_pct=round(stake / initial_bankroll, 4),
-            stake=stake, bankroll=initial_bankroll,
-            verdict="BET" if edge >= min_edge else "SKIP",
-            confidence="LOW",
-            notes=[f"league avg HR prob {LEAGUE_HR_PROB:.1%}"],
+            game_pk       = game_pk,
+            home_team     = home_team,
+            away_team     = away_team,
+            home_sp       = ph + "HP",
+            away_sp       = "",
+            bet_type      = "hr_prop",
+            bet_side      = f"{row['player']} HR Over {row.get('line', 0.5)}",
+            model_prob    = round(model_p, 4),
+            fair_prob     = round(implied_p, 4),
+            edge          = round(edge, 4),
+            american_odds = float(over_odds),
+            decimal_odds  = round(dec, 4),
+            vig           = 0.0,
+            n_books       = 1,
+            kelly_pct     = round(stake / initial_bankroll, 4),
+            stake         = stake,
+            bankroll      = initial_bankroll,
+            verdict       = "BET",
+            confidence    = "MEDIUM" if edge >= 0.07 else "LOW",
+            notes         = factor_notes,
         ))
 
     return sorted(recs, key=lambda r: r.edge, reverse=True)
-
 
 # ─────────────────────────────────────────────
 # 3-leg parlay builder
