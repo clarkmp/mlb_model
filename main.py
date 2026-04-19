@@ -31,6 +31,7 @@ from mlb_data import (
     fetch_today_schedule, fetch_mlb_odds,
     fetch_pitcher_stats, fetch_lineup_stats,
     fetch_hr_props, fetch_event_ids,
+    clear_corrupted_cache,
 )
 from mlb_features import build_features, build_game_features, TARGET_COL
 import mlb_features as _feat_module
@@ -566,7 +567,13 @@ def main():
     parser.add_argument("--bankroll", type=float, default=None)
     parser.add_argument("--min-edge", type=float, default=None)
     parser.add_argument("--kelly",    type=float, default=None)
+    parser.add_argument("--clear-cache", action="store_true",
+                        help="Delete corrupted cache files and exit")
     args = parser.parse_args()
+
+    if getattr(args, "clear_cache", False):
+        clear_corrupted_cache()
+        return
 
     if args.bankroll:  CONFIG["initial_bankroll"] = args.bankroll
     if args.min_edge:  CONFIG["min_edge"]         = args.min_edge

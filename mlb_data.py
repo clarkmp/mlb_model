@@ -42,18 +42,48 @@ def _get(url, params=None, cache_key="", cache_ttl_mins=60):
     if cache_key:
         cf = CACHE_DIR / f"{cache_key}.json"
         if cf.exists() and (time.time() - cf.stat().st_mtime) / 60 < cache_ttl_mins:
-            with open(cf) as f:
-                return json.load(f)
+            try:
+                with open(cf) as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, ValueError):
+                # Corrupted cache file (e.g. interrupted write) — delete and re-fetch
+                print(f"  Corrupted cache file {cf.name} — deleting and re-fetching...")
+                cf.unlink()
     resp = requests.get(url, params=params or {}, timeout=30)
     resp.raise_for_status()
     data = resp.json()
     if cache_key:
-        with open(CACHE_DIR / f"{cache_key}.json", "w") as f:
+        # Write atomically: write to .tmp first, then rename so a crash
+        # mid-write never leaves a half-written file in the cache
+        tmp = CACHE_DIR / f"{cache_key}.tmp"
+        with open(tmp, "w") as f:
             json.dump(data, f)
+        tmp.rename(CACHE_DIR / f"{cache_key}.json")
     return data
 
 def _mlb(endpoint, params=None, cache_key="", cache_ttl_mins=360):
     return _get(f"{MLB_API}/{endpoint}", params, cache_key, cache_ttl_mins)
+
+
+def clear_corrupted_cache():
+    """
+    Scan the cache directory and delete any JSON files that cannot be parsed.
+    Run this manually if you see JSONDecodeError on startup.
+    """
+    removed = 0
+    for cf in CACHE_DIR.glob("*.json"):
+        try:
+            with open(cf) as f:
+                json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            print(f"  Removing corrupted cache: {cf.name}")
+            cf.unlink()
+            removed += 1
+    if removed == 0:
+        print("  Cache is clean — no corrupted files found.")
+    else:
+        print(f"  Removed {removed} corrupted file(s). Re-run to fetch fresh data.")
+    return removed
 
 def _odds_api(endpoint, params, cache_key="", cache_ttl_mins=30):
     """Odds API call — always injects the API key."""
