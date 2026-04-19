@@ -30,8 +30,6 @@ ODDS_KEY = os.getenv("ODDS_API_KEY", "")
 
 FINAL_STATES = {"Final", "Game Over", "Completed Early", "F", "FT", "FR"}
 
-# Fliff bookmaker key as used by The Odds API
-FLIFF_KEY = "fliff"
 
 
 # ─────────────────────────────────────────────
@@ -400,7 +398,7 @@ def _parse_f5(bookmakers, home, away):
 
 def fetch_mlb_odds():
     """
-    Fetch moneyline + spread + F5 odds from FLIFF via The Odds API.
+    Fetch moneyline + spread + F5 odds from The Odds API (all US bookmakers).
     Returns a DataFrame with one row per game containing all markets.
     """
     if not ODDS_KEY:
@@ -412,16 +410,15 @@ def fetch_mlb_odds():
         resp = requests.get(
             f"{ODDS_API}/sports/baseball_mlb/odds",
             params={
-                "apiKey":      ODDS_KEY,
-                "regions":     "us",
-                "markets":     all_markets,
-                "oddsFormat":  "american",
-                "bookmakers":  FLIFF_KEY,   # FLIFF only
+                "apiKey":     ODDS_KEY,
+                "regions":    "us",
+                "markets":    all_markets,
+                "oddsFormat": "american",
             },
             timeout=20,
         )
         remaining = resp.headers.get("x-requests-remaining", "?")
-        print(f"  Odds API (FLIFF) → {resp.status_code} | quota remaining: {remaining}")
+        print(f"  Odds API → {resp.status_code} | quota remaining: {remaining}")
         resp.raise_for_status()
         games = resp.json()
     except Exception as e:
@@ -429,21 +426,8 @@ def fetch_mlb_odds():
         return pd.DataFrame()
 
     if not games:
-        print("  No FLIFF odds returned. FLIFF may not carry MLB or key is wrong.")
-        print("  Falling back to all US bookmakers...")
-        try:
-            resp2 = requests.get(
-                f"{ODDS_API}/sports/baseball_mlb/odds",
-                params={"apiKey": ODDS_KEY, "regions": "us",
-                        "markets": all_markets, "oddsFormat": "american"},
-                timeout=20,
-            )
-            resp2.raise_for_status()
-            games = resp2.json()
-            print(f"  Fallback: {len(games)} games from all books")
-        except Exception as e2:
-            print(f"  Fallback also failed: {e2}")
-            return pd.DataFrame()
+        print("  No odds returned from Odds API.")
+        return pd.DataFrame()
 
     rows = []
     for g in games:
@@ -503,7 +487,6 @@ def fetch_hr_props(game_id: str) -> pd.DataFrame:
                 "regions":    "us",
                 "markets":    "batter_home_runs",
                 "oddsFormat": "american",
-                "bookmakers": FLIFF_KEY,
             },
             timeout=20,
         )

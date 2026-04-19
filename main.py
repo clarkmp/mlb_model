@@ -10,11 +10,11 @@ Usage:
     python main.py --seasons 2022 2023 2024 2025
 
 Bet types produced in live mode:
-    - Moneyline        (FLIFF odds)
-    - Run line spread  (FLIFF odds, -1.5 / +1.5)
-    - First 5 innings  (FLIFF odds, SP-adjusted)
+    - Moneyline        (The Odds API)
+    - Run line spread  (The Odds API, -1.5 / +1.5)
+    - First 5 innings  (The Odds API, SP-adjusted)
     - 3-leg parlay     (top 3 moneyline edges combined)
-    - HR props         (batter HR over 0.5, FLIFF odds)
+    - HR props         (batter HR over 0.5, The Odds API)
 """
 
 import os, argparse, json, time
@@ -54,7 +54,7 @@ CONFIG = {
     # Train on last 3 completed seasons + current season
     "seasons":          [_CURRENT_YEAR - 3, _CURRENT_YEAR - 2,
                          _CURRENT_YEAR - 1, _CURRENT_YEAR],
-    "initial_bankroll": 1000.0,
+    "initial_bankroll": 250.0,
     "min_edge":         0.04,
     "kelly_frac":       0.25,
     "max_stake_pct":    0.03,    # hard cap: 3% of bankroll per bet
@@ -342,14 +342,11 @@ def _print_rec(rec, label_width=6):
 
 
 def run_live(model, history_df):
-    section("today's mlb picks — fliff odds")
+    section("today's mlb picks")
 
+    # Always use the configured bankroll for live picks.
+    # Training results do NOT carry over — each session starts fresh.
     bankroll = CONFIG["initial_bankroll"]
-    summ_path = CACHE_DIR / "last_summary.json"
-    if summ_path.exists():
-        with open(summ_path) as f:
-            s = json.load(f)
-        bankroll = s.get("final_bankroll_kelly", bankroll)
 
     FC = _feat_module.FEATURE_COLS
 
@@ -412,7 +409,7 @@ def run_live(model, history_df):
 
         odds_row = match(odds_df)
         if odds_row is None:
-            print(f"  {away} @ {home}  — no FLIFF odds available")
+            print(f"  {away} @ {home}  — no odds available")
             continue
 
         n_books = int(odds_row.get("n_books", 1))
