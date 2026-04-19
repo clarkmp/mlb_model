@@ -12,9 +12,7 @@ Usage:
 Bet types produced in live mode:
     - Moneyline        (The Odds API)
     - Run line spread  (The Odds API, -1.5 / +1.5)
-    - First 5 innings  (The Odds API, SP-adjusted)
     - 3-leg parlay     (top 3 moneyline edges combined)
-    - HR props         (batter HR over 0.5, The Odds API)
 """
 
 import os, argparse, json, time
@@ -30,9 +28,6 @@ from mlb_data import (
     fetch_season_schedule, fetch_team_season_stats,
     fetch_today_schedule, fetch_mlb_odds,
     fetch_pitcher_stats, fetch_lineup_stats,
-    fetch_hr_props, fetch_event_ids,
-    fetch_pitcher_hand, fetch_batter_hand,
-    fetch_weather, get_hr_park_factor,
     clear_corrupted_cache,
 )
 from mlb_features import build_features, build_game_features, TARGET_COL
@@ -43,7 +38,7 @@ from mlb_model import (
 )
 from mlb_betting import (
     evaluate_moneyline, evaluate_spread,
-    evaluate_hr_props, build_parlay,
+    build_parlay,
     run_backtest, edge_buckets, monthly_performance,
     american_to_decimal,
 )
@@ -58,7 +53,7 @@ CONFIG = {
     "seasons":          [_CURRENT_YEAR - 3, _CURRENT_YEAR - 2,
                          _CURRENT_YEAR - 1, _CURRENT_YEAR],
     "initial_bankroll": 250.0,
-    "min_edge":         0.04,
+    "min_edge":         0.06,   # 6% minimum edge — quality over quantity
     "kelly_frac":       0.25,
     "max_stake_pct":    0.03,    # hard cap: 3% of bankroll per bet
     "min_train_games":  300,
@@ -330,9 +325,6 @@ def _print_rec(rec, label_width=6):
         for leg in rec.bet_side.split("\n    "):
             print(f"  │  {leg.strip()}")
         print(f"  └─ Note: {' | '.join(rec.notes)}")
-    elif rec.bet_type == "hr_prop":
-        print(f"  HR PROP  {rec.bet_side:<38} {odds_s:>6}  "
-              f"Edge:{edge_s:>6}  Stake:{stake_s:>8}  [{tag}]")
     else:
         type_tag = {"moneyline": "ML", "spread": "RL"}.get(rec.bet_type, rec.bet_type.upper())
         matchup  = f"{rec.away_team} @ {rec.home_team}"
@@ -371,15 +363,13 @@ def run_live(model, history_df):
         print("  No MLB games today.")
         return
 
-    odds_df    = fetch_mlb_odds()
-    event_ids  = fetch_event_ids()
-    season     = datetime.now().year
-    game_list  = _build_upcoming_features(today_df, history_df)
+    odds_df   = fetch_mlb_odds()
+    season    = datetime.now().year
+    game_list = _build_upcoming_features(today_df, history_df)
 
     # ── Prepare output ───────────────────────────────────────────────────
-    all_recs    = []
-    ml_recs     = []
-    hr_all      = []
+    all_recs = []
+    ml_recs  = []
 
     print()
     kv("Bankroll:", f"${bankroll:,.2f}")
@@ -424,8 +414,28 @@ def run_live(model, history_df):
 
         odds_row = match(odds_df)
         if odds_row is None:
-            print(f"  {away} @ {home}  — no odds available")
-            continue
+            continue   # silently skip — no odds means game likely already started
+
+        # ── Skip games that have already started ─────────────────────────
+        # Check commence_time from odds API (UTC ISO string)
+        commence = odds_row.get("commence_time", "")
+        if commence:
+            try:
+                from datetime import timezone
+                game_utc = datetime.fromisoformat(
+                    commence.replace("Z", "+00:00")
+                )
+                now_utc = datetime.now(timezone.utc)
+                if game_utc <= now_utc:
+                    continue   # game has started or passed — skip
+            except Exception:
+                pass
+        # Also check MLB status field from schedule (belt-and-suspenders)
+        today_row = today_df[today_df["game_pk"] == gpk]
+        if not today_row.empty:
+            mlb_status = str(today_row.iloc[0].get("status", ""))
+            if any(s in mlb_status for s in ("Live", "In Progress", "Manager", "Warmup")):
+                continue
 
         n_books = int(odds_row.get("n_books", 1))
 
@@ -464,120 +474,70 @@ def run_live(model, history_df):
 
 
 
-        # ── HR props ─────────────────────────────────────────────────────
-        event_id = event_ids.get((home, away))
-        if event_id:
-            hr_df = fetch_hr_props(event_id)
-
-            # Enrich hr_df with batter handedness
-            if not hr_df.empty and "batter_id" in hr_df.columns:
-                hr_df["bats"] = hr_df["batter_id"].apply(
-                    lambda bid: fetch_batter_hand(int(bid)) if pd.notna(bid) else "R"
-                )
-            elif not hr_df.empty and "bats" not in hr_df.columns:
-                hr_df["bats"] = "R"   # default if ID not available
-
-            # Opposing pitcher handedness (home batters face away SP, vice versa)
-            home_sp_hand = fetch_pitcher_hand(feat.get("away_sp_id")) if feat.get("away_sp_id") else "R"
-            away_sp_hand = fetch_pitcher_hand(feat.get("home_sp_id")) if feat.get("home_sp_id") else "R"
-
-            # Weather for this ballpark
-            weather = fetch_weather(home)
-            hr_park = get_hr_park_factor(home)
-
-            # Evaluate home batters (face away SP) and away batters (face home SP)
-            for batter_side, opp_hand in [("home", home_sp_hand), ("away", away_sp_hand)]:
-                side_hr_df = hr_df[hr_df.get("team", pd.Series(["both"]*len(hr_df))) != (
-                    "away" if batter_side == "home" else "home"
-                )].copy() if "team" in hr_df.columns else hr_df.copy()
-
-                hr_recs = evaluate_hr_props(
-                    hr_df            = side_hr_df,
-                    game_pk          = gpk,
-                    home_team        = home,
-                    away_team        = away,
-                    initial_bankroll = bankroll,
-                    pitcher_hand     = opp_hand,
-                    park_factor      = hr_park,
-                    wind_mph         = weather.get("wind_mph", 0.0),
-                    wind_dir         = weather.get("wind_dir", ""),
-                    temp_f           = weather.get("temp_f", 72.0),
-                    home_game        = (batter_side == "home"),
-                    min_edge         = 0.04,
-                    kelly_frac       = 0.15,
-                    max_stake_pct    = 0.02,
-                )
-                hr_all.extend(hr_recs)
-                all_recs.extend(hr_recs)
-
-    # ── 3-leg parlay ─────────────────────────────────────────────────────
-    parlay = build_parlay(ml_recs, bankroll,
+    # ── 3-leg parlay — built from the top qualifying ML bets only ─────────
+    # Pre-filter to BET-only before building parlay so we don't combine weak legs
+    ml_bets_for_parlay = sorted(
+        [r for r in ml_recs if r.verdict == "BET"],
+        key=lambda x: x.edge, reverse=True
+    )
+    parlay = build_parlay(ml_bets_for_parlay, bankroll,
                           kelly_frac=0.10, max_stake_pct=0.02)
     if parlay:
         all_recs.append(parlay)
 
-    # ── Print results ─────────────────────────────────────────────────────
+    # ── Print results — quality over quantity: top 3 per category, BET only ──
     section("moneyline picks")
-    ml_actionable = [r for r in ml_recs if r.verdict in ("BET","LEAN")]
-    if ml_actionable:
-        for r in sorted(ml_actionable, key=lambda x: x.edge, reverse=True):
+    # Only show BET (not LEAN), sorted by edge, capped at 3
+    ml_bets = sorted(
+        [r for r in ml_recs if r.verdict == "BET"],
+        key=lambda x: x.edge, reverse=True
+    )[:3]
+    if ml_bets:
+        for r in ml_bets:
             _print_rec(r)
     else:
-        print("  No moneyline value found today.")
+        print("  No high-confidence moneyline value found today.")
+        print(f"  (Requires edge ≥ {CONFIG['min_edge']:.0%}. "
+              f"Leans below threshold are filtered out.)")
 
     section("run line picks")
-    rl_recs = [r for r in all_recs
-               if r.bet_type == "spread" and r.verdict in ("BET","LEAN")]
-    if rl_recs:
-        for r in sorted(rl_recs, key=lambda x: x.edge, reverse=True):
+    rl_bets = sorted(
+        [r for r in all_recs if r.bet_type == "spread" and r.verdict == "BET"],
+        key=lambda x: x.edge, reverse=True
+    )[:3]
+    if rl_bets:
+        for r in rl_bets:
             _print_rec(r)
     else:
-        print("  No run line value found today.")
+        print("  No high-confidence run line value found today.")
 
     section("3-leg parlay recommendation")
+    # Parlay is built from top moneyline bets only
     if parlay and parlay.verdict == "BET":
         _print_rec(parlay)
-    elif parlay:
-        print(f"  Parlay built but verdict is {parlay.verdict} "
-              f"(edge {parlay.edge*100:.1f}% — below threshold).")
-        _print_rec(parlay)
+    elif len(ml_bets) < 3:
+        print(f"  Need 3 qualifying moneyline picks to build a parlay "
+              f"({len(ml_bets)} found today).")
     else:
-        print("  Need at least 3 qualifying moneyline picks to build a parlay.")
-
-    section("home run props")
-    hr_actionable = [r for r in hr_all if r.verdict == "BET"]
-    # Deduplicate same player appearing from home/away loop
-    seen_hr, hr_unique = set(), []
-    for r in sorted(hr_actionable, key=lambda x: x.edge, reverse=True):
-        if r.bet_side not in seen_hr:
-            seen_hr.add(r.bet_side)
-            hr_unique.append(r)
-    if hr_unique:
-        print(f"  {'PLAYER / BET':<42}  {'OPP':<5}  {'ODDS':>6}  "
-              f"{'MODEL':>7}  {'EDGE':>6}  {'STAKE':>8}  VERDICT")
-        div()
-        for r in hr_unique[:6]:
-            opp = r.home_sp if r.home_sp else "?"
-            print(f"  {r.bet_side:<42}  {opp:<5}  {int(r.american_odds):>+6}  "
-                  f"{r.model_prob*100:>6.1f}%  {r.edge*100:>+5.1f}%  "
-                  f"${r.stake:>7.2f}  [BET]")
-            print(f"    Factors: {' | '.join(r.notes)}")
-    else:
-        print("  No HR prop value found today.")
-        print("  (Odds API may not carry batter_home_runs, or all lines priced fairly)")
+        print("  Parlay edge below threshold — not recommended today.")
 
     # ── Summary ───────────────────────────────────────────────────────────
     section("daily summary")
-    bets = [r for r in all_recs if r.verdict == "BET"]
-    leans = [r for r in all_recs if r.verdict == "LEAN"]
-    total_stake = sum(r.stake for r in bets + leans)
-    kv("Games evaluated:",    len(set(r.game_pk for r in all_recs if r.game_pk > 0)))
-    kv("Bets flagged (★):",   len(bets))
-    kv("Leans flagged (~):",  len(leans))
-    kv("Total stake today:",  f"${total_stake:.2f}")
-    kv("Bankroll:",           f"${bankroll:,.2f}")
-    kv("Max single stake:",   f"${bankroll * CONFIG['max_stake_pct']:.2f} "
-                              f"({CONFIG['max_stake_pct']:.0%} cap)")
+    all_bets    = ml_bets + rl_bets
+    total_stake = sum(r.stake for r in all_bets)
+    if parlay and parlay.verdict == "BET":
+        total_stake += parlay.stake
+    kv("Games with odds available:", len(set(r.game_pk for r in all_recs if r.game_pk > 0)))
+    kv("Moneyline bets:",  len(ml_bets))
+    kv("Run line bets:",   len(rl_bets))
+    kv("Parlay:",          "Yes" if parlay and parlay.verdict == "BET" else "No")
+    kv("Total stake:",     f"${total_stake:.2f}")
+    kv("Bankroll:",        f"${bankroll:,.2f}")
+    kv("Edge threshold:",  f"{CONFIG['min_edge']:.0%} minimum (quality filter)")
+
+    if not all_bets:
+        print()
+        print("  No value found today — discipline beats forcing bets.")
 
     if not bets and not leans:
         print()
