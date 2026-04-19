@@ -8,7 +8,9 @@ Sources:
     * Schedule / results, team stats, pitcher stats, lineups
   - The Odds API — live odds (requires ODDS_API_KEY in .env)
     * Bookmaker filter: FLIFF only (bookmaker key: "fliff")
-    * Markets fetched: h2h (moneyline), spreads (run line), h2h_h1 (F5)
+    * Markets fetched: h2h (moneyline), spreads (run line)
+    * Note: F5 odds are not a separate Odds API market — F5 bets use
+    *       the moneyline adjusted by SP ERA differential
     * Player props: batter_home_runs
 """
 
@@ -379,21 +381,12 @@ def _parse_spread(bookmakers, home, away):
 
 
 def _parse_f5(bookmakers, home, away):
-    """Extract First 5 Innings moneyline (market key: h2h_h1 on Odds API)."""
-    h_list, a_list = [], []
-    for book in bookmakers:
-        for mkt in book.get("markets", []):
-            if mkt["key"] not in ("h2h_h1", "h2h_1st_5_innings"):
-                continue
-            for o in mkt["outcomes"]:
-                if o["name"] == home:
-                    h_list.append(o["price"])
-                elif o["name"] == away:
-                    a_list.append(o["price"])
-    if not h_list or not a_list:
-        return None, None
-    best = lambda lst: max(lst, key=lambda x: x if x > 0 else 10000/abs(x))
-    return best(h_list), best(a_list)
+    """
+    F5 innings is not a standard Odds API market for MLB.
+    Returns None, None — F5 recommendations are derived in mlb_betting.py
+    using the full-game moneyline odds adjusted by SP ERA differential.
+    """
+    return None, None
 
 
 def fetch_mlb_odds():
@@ -405,7 +398,7 @@ def fetch_mlb_odds():
         print("  No ODDS_API_KEY in .env — skipping live odds.")
         return pd.DataFrame()
 
-    all_markets = "h2h,spreads,h2h_h1"
+    all_markets = "h2h,spreads"
     try:
         resp = requests.get(
             f"{ODDS_API}/sports/baseball_mlb/odds",
@@ -455,9 +448,9 @@ def fetch_mlb_odds():
             "rl_home_odds":     rl_home_odds,
             "rl_away_line":     rl_away_pts,
             "rl_away_odds":     rl_away_odds,
-            # First 5 innings
-            "f5_home_odds":     f5_home,
-            "f5_away_odds":     f5_away,
+            # First 5 innings — derived from ML odds + SP ERA, not a separate market
+            "f5_home_odds":     None,
+            "f5_away_odds":     None,
         })
 
     df = pd.DataFrame(rows)

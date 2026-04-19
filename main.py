@@ -448,22 +448,24 @@ def run_live(model, history_df):
                 all_recs.append(rl)
 
         # ── First 5 innings ──────────────────────────────────────────────
-        if pd.notna(odds_row.get("f5_home_odds")):
-            f5 = evaluate_f5(
-                game_pk=gpk, home_team=home, away_team=away,
-                home_sp=home_sp, away_sp=away_sp,
-                model_prob_home=model_prob,
-                f5_home_odds=float(odds_row["f5_home_odds"]),
-                f5_away_odds=float(odds_row["f5_away_odds"]),
-                home_sp_stats=home_sp_stats,
-                away_sp_stats=away_sp_stats,
-                initial_bankroll=bankroll,
-                min_edge=CONFIG["min_edge"],
-                kelly_frac=CONFIG["kelly_frac"],
-                max_stake_pct=CONFIG["max_stake_pct"],
-            )
-            if f5:
-                all_recs.append(f5)
+        # The Odds API does not offer a separate F5 market for MLB.
+        # We evaluate F5 using the full-game moneyline odds adjusted by
+        # the SP ERA differential. This gives a fair F5 probability estimate.
+        f5 = evaluate_f5(
+            game_pk=gpk, home_team=home, away_team=away,
+            home_sp=home_sp, away_sp=away_sp,
+            model_prob_home=model_prob,
+            f5_home_odds=float(odds_row["home_odds"]),   # use ML odds as base
+            f5_away_odds=float(odds_row["away_odds"]),
+            home_sp_stats=home_sp_stats,
+            away_sp_stats=away_sp_stats,
+            initial_bankroll=bankroll,
+            min_edge=CONFIG["min_edge"],
+            kelly_frac=CONFIG["kelly_frac"],
+            max_stake_pct=CONFIG["max_stake_pct"],
+        )
+        if f5:
+            all_recs.append(f5)
 
         # ── HR props ─────────────────────────────────────────────────────
         event_id = event_ids.get((home, away))
