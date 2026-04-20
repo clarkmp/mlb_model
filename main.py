@@ -539,10 +539,6 @@ def run_live(model, history_df):
         print()
         print("  No value found today — discipline beats forcing bets.")
 
-    if not bets and not leans:
-        print()
-        print("  No value found today — discipline beats forcing bets.")
-
 
 # ─────────────────────────────────────────────
 # Entry point
