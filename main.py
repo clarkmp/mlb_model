@@ -485,38 +485,95 @@ def run_live(model, history_df):
     if parlay:
         all_recs.append(parlay)
 
-    # ── Print results — quality over quantity: top 3 per category, BET only ──
-    section("moneyline picks")
-    # Only show BET (not LEAN), sorted by edge, capped at 3
-    ml_bets = sorted(
-        [r for r in ml_recs if r.verdict == "BET"],
-        key=lambda x: x.edge, reverse=True
-    )[:3]
-    if ml_bets:
-        for r in ml_bets:
-            _print_rec(r)
-    else:
-        print("  No high-confidence moneyline value found today.")
-        print(f"  (Requires edge ≥ {CONFIG['min_edge']:.0%}. "
-              f"Leans below threshold are filtered out.)")
+    # ── Build per-game lookup maps ─────────────────────────────────────────
+    # Index ML and RL recs by game_pk so we can print them together per game
+    ml_by_pk = {r.game_pk: r for r in ml_recs}
+    rl_by_pk = {}
+    for r in all_recs:
+        if r.bet_type == "spread" and r.game_pk not in rl_by_pk:
+            rl_by_pk[r.game_pk] = r
 
-    section("run line picks")
-    rl_bets = sorted(
-        [r for r in all_recs if r.bet_type == "spread" and r.verdict == "BET"],
-        key=lambda x: x.edge, reverse=True
-    )[:3]
-    if rl_bets:
-        for r in rl_bets:
-            _print_rec(r)
-    else:
-        print("  No high-confidence run line value found today.")
+    # Ordered list of unique game_pks in the order they were evaluated
+    seen_pks, ordered_pks = set(), []
+    for r in all_recs:
+        if r.game_pk > 0 and r.game_pk not in seen_pks:
+            seen_pks.add(r.game_pk)
+            ordered_pks.append(r.game_pk)
 
+    # ── Helper: resolve bet_side to team name ────────────────────────────
+    def resolve_pick(rec):
+        side = rec.bet_side
+        if side in ("home", "home -1.5"):
+            team = rec.home_team
+            line = "" if rec.bet_type == "moneyline" else " -1.5"
+        elif side in ("away", "away +1.5"):
+            team = rec.away_team
+            line = "" if rec.bet_type == "moneyline" else " +1.5"
+        else:
+            parts = side.split()
+            team = rec.home_team if parts[0] == "home" else rec.away_team
+            line = " " + " ".join(parts[1:]) if len(parts) > 1 else ""
+        return f"{team}{line}"
+
+    def fmt_row(rec):
+        matchup   = f"{rec.away_team} @ {rec.home_team}"
+        pick_s    = resolve_pick(rec)
+        odds_s    = f"{int(rec.american_odds):+d}"
+        edge_s    = f"{'+' if rec.edge >= 0 else ''}{rec.edge*100:.1f}%"
+        verdict_s = "★ BET" if rec.verdict == "BET" else "  pass"
+        stake_s   = f"${rec.stake:.2f}" if rec.verdict == "BET" else "——"
+        return (f"  {matchup:<42}  {pick_s:<26}  {odds_s:>6}  "
+                f"{rec.model_prob*100:>5.1f}%  {edge_s:>6}  {stake_s:>7}  {verdict_s}")
+
+    COL_HDR = (f"  {'MATCHUP':<42}  {'PICK':<26}  {'ODDS':>6}  "
+               f"{'MODEL':>6}  {'EDGE':>6}  {'STAKE':>7}  VERDICT")
+
+    ml_bets, rl_bets = [], []
+
+    # ── Moneyline section ─────────────────────────────────────────────────
+    section("moneyline picks — every game")
+    print(COL_HDR)
+    div()
+    for gpk in ordered_pks:
+        ml = ml_by_pk.get(gpk)
+        if ml is None:
+            continue
+        print(fmt_row(ml))
+        if ml.verdict == "BET":
+            ml_bets.append(ml)
+    if not ordered_pks:
+        print("  No games with odds available today.")
+
+    # ── Run line section ──────────────────────────────────────────────────
+    section("run line picks — every game")
+    print(COL_HDR)
+    div()
+    rl_printed = 0
+    for gpk in ordered_pks:
+        rl = rl_by_pk.get(gpk)
+        if rl is None:
+            continue
+        print(fmt_row(rl))
+        rl_printed += 1
+        if rl.verdict == "BET":
+            rl_bets.append(rl)
+    if rl_printed == 0:
+        print("  No run line odds available today.")
+
+    # ── 3-leg parlay ─────────────────────────────────────────────────────
     section("3-leg parlay recommendation")
-    # Parlay is built from top moneyline bets only
     if parlay and parlay.verdict == "BET":
-        _print_rec(parlay)
+        tag_p   = "★ BET"
+        edge_s  = f"+{parlay.edge*100:.1f}%"
+        odds_s  = f"{int(parlay.american_odds):+d}"
+        stake_s = f"${parlay.stake:.2f}"
+        print(f"  ┌─ 3-LEG PARLAY  {odds_s}  "
+              f"Prob:{parlay.model_prob*100:.1f}%  Edge:{edge_s}  Stake:{stake_s}  [{tag_p}]")
+        for leg in parlay.bet_side.split("\n    "):
+            print(f"  │  {leg.strip()}")
+        print(f"  └─ Note: {' | '.join(parlay.notes)}")
     elif len(ml_bets) < 3:
-        print(f"  Need 3 qualifying moneyline picks to build a parlay "
+        print(f"  Need 3 qualifying moneyline bets to build a parlay "
               f"({len(ml_bets)} found today).")
     else:
         print("  Parlay edge below threshold — not recommended today.")
@@ -527,17 +584,18 @@ def run_live(model, history_df):
     total_stake = sum(r.stake for r in all_bets)
     if parlay and parlay.verdict == "BET":
         total_stake += parlay.stake
-    kv("Games with odds available:", len(set(r.game_pk for r in all_recs if r.game_pk > 0)))
-    kv("Moneyline bets:",  len(ml_bets))
-    kv("Run line bets:",   len(rl_bets))
-    kv("Parlay:",          "Yes" if parlay and parlay.verdict == "BET" else "No")
-    kv("Total stake:",     f"${total_stake:.2f}")
-    kv("Bankroll:",        f"${bankroll:,.2f}")
-    kv("Edge threshold:",  f"{CONFIG['min_edge']:.0%} minimum (quality filter)")
+    kv("Games listed:",        len(ordered_pks))
+    kv("Moneyline bets (★):",  len(ml_bets))
+    kv("Run line bets (★):",   len(rl_bets))
+    kv("Parlay:",              "★ BET" if parlay and parlay.verdict == "BET" else "pass")
+    kv("Total stake today:",   f"${total_stake:.2f}")
+    kv("Bankroll:",            f"${bankroll:,.2f}")
+    kv("Edge threshold:",      f"{CONFIG['min_edge']:.0%} — below this = pass")
 
     if not all_bets:
         print()
-        print("  No value found today — discipline beats forcing bets.")
+        print("  No edges found today — all games marked pass.")
+        print("  Discipline beats forcing bets.")
 
 
 # ─────────────────────────────────────────────
