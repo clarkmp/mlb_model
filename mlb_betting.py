@@ -236,14 +236,6 @@ def evaluate_spread(
     
     p_home_cover = model_prob_home * COVER_RATE
     p_away_cover = 1.0 - p_home_cover
-    
-    # DEBUG: Log the calculation for diagnosis
-    import sys
-    if model_prob_home > 0.70 and home_team == "Los Angeles Dodgers":
-        print(f"\nDEBUG RL calc for {home_team}:", file=sys.stderr)
-        print(f"  model_prob_home (ML): {model_prob_home:.1%}", file=sys.stderr)
-        print(f"  p_home_cover (-1.5): {p_home_cover:.1%}", file=sys.stderr)
-        print(f"  p_away_cover (+1.5): {p_away_cover:.1%}", file=sys.stderr)
 
     fair_h, fair_a = remove_vig(rl_home_odds, rl_away_odds)
     vig = vig_pct(rl_home_odds, rl_away_odds)
