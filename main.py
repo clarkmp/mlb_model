@@ -713,7 +713,7 @@ def main():
                 return
         if history_df is None:
             games_raw  = load_games(CONFIG["seasons"])
-            games_raw  = load_odds_for_history(games_raw)
+            games_raw  = load_odds_for_history(games_raw, CONFIG["seasons"])
             team_stats = load_team_stats(CONFIG["seasons"])
             history_df = build_features(
                 games_raw,
