@@ -31,14 +31,25 @@ from typing import Optional
 # ─────────────────────────────────────────────
 
 def american_to_decimal(am: float) -> float:
+    """Convert American odds to decimal. Handles edge cases."""
+    if am is None or am == 0:
+        return 2.0  # Even odds fallback
     return (am / 100 + 1) if am > 0 else (100 / abs(am) + 1)
 
 def american_to_raw_prob(am: float) -> float:
+    """Convert American odds to raw probability. Handles edge cases."""
+    if am is None or am == 0:
+        return 0.5  # Even probability fallback
     return 100 / (am + 100) if am > 0 else abs(am) / (abs(am) + 100)
 
 def remove_vig(odds_a: float, odds_b: float) -> tuple[float, float]:
+    """Remove vig from odds pair. Handles edge cases."""
+    if odds_a is None or odds_b is None or odds_a == 0 or odds_b == 0:
+        return 0.5, 0.5  # Equal probability fallback
     ra, rb  = american_to_raw_prob(odds_a), american_to_raw_prob(odds_b)
     total   = ra + rb
+    if total == 0:
+        return 0.5, 0.5
     return ra / total, rb / total
 
 def vig_pct(odds_a: float, odds_b: float) -> float:
@@ -483,6 +494,14 @@ def run_backtest(
     """
     valid = df.dropna(subset=["model_prob", "home_win", "home_odds", "away_odds"])
     valid = valid[valid["fold"] >= 0].copy().reset_index(drop=True)
+    
+    # Filter out games with invalid odds (0 or extreme values)
+    valid = valid[
+        (valid["home_odds"] != 0) & 
+        (valid["away_odds"] != 0) &
+        (valid["home_odds"].abs() < 10000) &
+        (valid["away_odds"].abs() < 10000)
+    ].reset_index(drop=True)
 
     running_kelly = initial_bankroll
     running_flat  = initial_bankroll
