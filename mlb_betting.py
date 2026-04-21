@@ -223,19 +223,35 @@ def evaluate_spread(
     if rl_home_odds is None or rl_away_odds is None:
         return None
 
-    # Approximate probability of covering each side based on empirical MLB data (2023-2024):
-    # - When home team wins, they cover -1.5 (win by 2+) 68.6% of the time
-    # - When home team loses, away covers +1.5 100% of the time
-    # - When home wins by 1, away covers +1.5
-    # 
-    # Therefore:
-    # P(home covers -1.5) = P(home wins) × P(covers | wins) = P(home wins) × 0.686
-    # P(away covers +1.5) = 1 - P(home covers -1.5)
+    # Empirically validated: when a team wins, they cover -1.5 about 68.6% of the time
+    COVER_RATE = 0.686
     
-    COVER_RATE = 0.686  # Empirically validated from 2023-2024 MLB data
+    # Calculate cover probabilities for BOTH sides correctly
+    # The HOME team's probability of covering -1.5:
+    p_home_cover_minus_1_5 = model_prob_home * COVER_RATE
+    # The AWAY team's probability of covering -1.5:
+    model_prob_away = 1.0 - model_prob_home
+    p_away_cover_minus_1_5 = model_prob_away * COVER_RATE
     
-    p_home_cover = model_prob_home * COVER_RATE
-    p_away_cover = 1.0 - p_home_cover
+    # The +1.5 lines are simply the complements:
+    p_home_cover_plus_1_5 = 1.0 - p_away_cover_minus_1_5
+    p_away_cover_plus_1_5 = 1.0 - p_home_cover_minus_1_5
+    
+    # Now match to actual run lines in the odds
+    # Home team is typically -1.5 if favorite, +1.5 if underdog
+    # Away team is typically -1.5 if favorite, +1.5 if underdog
+    
+    # Determine which side is favorite based on the line
+    home_is_favorite = rl_home_line < 0  # Negative line means favorite
+    
+    if home_is_favorite:
+        # Home team -1.5, Away team +1.5
+        p_home_cover = p_home_cover_minus_1_5
+        p_away_cover = p_away_cover_plus_1_5
+    else:
+        # Away team -1.5, Home team +1.5
+        p_home_cover = p_home_cover_plus_1_5
+        p_away_cover = p_away_cover_minus_1_5
 
     fair_h, fair_a = remove_vig(rl_home_odds, rl_away_odds)
     vig = vig_pct(rl_home_odds, rl_away_odds)
