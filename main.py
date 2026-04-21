@@ -53,7 +53,7 @@ CONFIG = {
     "seasons":          [_CURRENT_YEAR - 3, _CURRENT_YEAR - 2,
                          _CURRENT_YEAR - 1, _CURRENT_YEAR],
     "initial_bankroll": 250.0,
-    "min_edge":         0.06,   # 6% minimum edge — quality over quantity
+    "min_edge":         0.25,   # 25% minimum edge — extremely selective
     "kelly_frac":       0.25,
     "max_stake_pct":    0.03,    # hard cap: 3% of bankroll per bet
     "min_train_games":  300,
@@ -559,12 +559,10 @@ def run_live(model, history_df):
         if r.bet_type == "spread" and r.game_pk not in rl_by_pk:
             rl_by_pk[r.game_pk] = r
 
-    # Ordered list of unique game_pks in the order they were evaluated
-    seen_pks, ordered_pks = set(), []
-    for r in all_recs:
-        if r.game_pk > 0 and r.game_pk not in seen_pks:
-            seen_pks.add(r.game_pk)
-            ordered_pks.append(r.game_pk)
+    # Sort games by EDGE (highest first) instead of by time
+    # This shows the best opportunities first
+    ml_sorted = sorted(ml_recs, key=lambda r: r.edge, reverse=True)
+    ordered_pks = [r.game_pk for r in ml_sorted if r.game_pk > 0]
 
     # ── Helper: resolve bet_side to team name ────────────────────────────
     def resolve_pick(rec):
@@ -597,7 +595,7 @@ def run_live(model, history_df):
     ml_bets, rl_bets = [], []
 
     # ── Moneyline section ─────────────────────────────────────────────────
-    section("moneyline picks — every game")
+    section("moneyline picks — sorted by edge")
     print(COL_HDR)
     div()
     for gpk in ordered_pks:
@@ -611,7 +609,7 @@ def run_live(model, history_df):
         print("  No games with odds available today.")
 
     # ── Run line section ──────────────────────────────────────────────────
-    section("run line picks — every game")
+    section("run line picks — sorted by edge")
     print(COL_HDR)
     div()
     rl_printed = 0
