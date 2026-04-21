@@ -125,36 +125,102 @@ def load_team_stats(seasons):
     return df
 
 
-def load_odds_for_history(games_df):
-    """Synthesise approximate historical odds for backtest simulation."""
+def load_odds_for_history(games_df, seasons):
+    """
+    Load real historical odds from GitHub dataset (2021-2025) + optional scraping.
+    Falls back to synthetic odds for games before 2021 or if real odds unavailable.
+    """
     if "home_odds" in games_df.columns and games_df["home_odds"].notna().sum() > 100:
+        print("  Odds already present in DataFrame — skipping load")
         return games_df
 
-    print("  Synthesising historical odds from team win rates + park factors...")
-    from mlb_data import PARK_FACTORS
+    print("  Loading real historical odds from GitHub dataset...")
+    
+    try:
+        from odds_loader import load_historical_odds
+        odds_df = load_historical_odds(seasons, enable_scraping=False)
+        
+        if odds_df.empty:
+            print("  WARNING: Failed to load real odds — falling back to synthesis")
+            return _synthesize_odds_fallback(games_df)
+        
+        # Merge on (game_date, home_team, away_team)
+        df = games_df.copy()
+        df["game_date"] = pd.to_datetime(df["game_date"]).dt.date
+        odds_df["game_date"] = pd.to_datetime(odds_df["game_date"]).dt.date
+        
+        # Use closing odds (most accurate representation of market)
+        odds_slim = odds_df[[
+            "game_date", "home_team", "away_team",
+            "home_ml_close", "away_ml_close",
+            "home_rl_close", "away_rl_close", "rl_line"
+        ]].rename(columns={
+            "home_ml_close": "home_odds",
+            "away_ml_close": "away_odds",
+            "home_rl_close": "rl_home_odds",
+            "away_rl_close": "rl_away_odds",
+            "rl_line": "rl_home_line",
+        })
+        odds_slim["rl_away_line"] = -odds_slim["rl_home_line"]
+        
+        merged = df.merge(
+            odds_slim,
+            on=["game_date", "home_team", "away_team"],
+            how="left"
+        )
+        
+        # Count coverage
+        real_odds = merged["home_odds"].notna().sum()
+        total = len(merged)
+        coverage = real_odds / total * 100 if total > 0 else 0
+        
+        print(f"  Real odds coverage: {real_odds}/{total} games ({coverage:.1f}%)")
+        
+        # Fill missing with synthesis
+        if real_odds < total:
+            missing = total - real_odds
+            print(f"  Synthesizing odds for {missing} games without real data...")
+            synth_df = _synthesize_odds_fallback(merged[merged["home_odds"].isna()])
+            merged.loc[merged["home_odds"].isna(), "home_odds"] = synth_df["home_odds"]
+            merged.loc[merged["away_odds"].isna(), "away_odds"] = synth_df["away_odds"]
+        
+        # Convert game_date back to string for consistency
+        merged["game_date"] = merged["game_date"].astype(str)
+        
+        return merged
+    
+    except Exception as e:
+        print(f"  ERROR loading real odds: {e}")
+        print("  Falling back to synthetic odds...")
+        return _synthesize_odds_fallback(games_df)
 
+
+def _synthesize_odds_fallback(games_df):
+    """Fallback synthetic odds generator for games without real odds data."""
+    from mlb_data import PARK_FACTORS
+    
     df = games_df.copy()
     df["game_date"] = pd.to_datetime(df["game_date"])
     df = df.sort_values("game_date").reset_index(drop=True)
-
+    
     df["_roll_wr"] = (
         df.groupby("home_team")["home_win"]
         .transform(lambda x: x.shift(1).rolling(60, min_periods=10).mean())
         .fillna(0.54)
     )
     pf = df["home_team"].map(PARK_FACTORS).fillna(1.00)
-    raw_prob  = ((df["_roll_wr"] * 0.65 + 0.54 * 0.35) * pf).clip(0.30, 0.72)
-    rng       = np.random.default_rng(42)
-    noisy_p   = (raw_prob + rng.normal(0, 0.02, len(df))).clip(0.28, 0.74)
-
+    raw_prob = ((df["_roll_wr"] * 0.65 + 0.54 * 0.35) * pf).clip(0.30, 0.72)
+    rng = np.random.default_rng(42)
+    noisy_p = (raw_prob + rng.normal(0, 0.02, len(df))).clip(0.28, 0.74)
+    
     def to_am(p):
         p_vig = float(p) * 0.952
         p_vig = max(0.10, min(0.90, p_vig))
         if p_vig >= 0.5:
             return -int(round(p_vig / (1 - p_vig) * 100 / 5) * 5)
         else:
-            return  int(round((1 - p_vig) / p_vig * 100 / 5) * 5)
-
+            return int(round((1 - p_vig) / p_vig * 100 / 5) * 5)
+    
     df["home_odds"] = noisy_p.apply(to_am)
     df["away_odds"] = (1 - noisy_p).apply(to_am)
     df = df.drop(columns=["_roll_wr"])
@@ -172,7 +238,7 @@ def run_train(seasons):
         print("  ERROR: No game data. Check internet connection and run debug_api.py")
         return None, None, None
 
-    games_raw = load_odds_for_history(games_raw)
+    games_raw = load_odds_for_history(games_raw, seasons)
     games_raw["game_date"] = pd.to_datetime(games_raw["game_date"])
     kv("Games loaded:",   len(games_raw))
     kv("Seasons:",        ", ".join(str(y) for y in sorted(games_raw["game_date"].dt.year.unique())))
