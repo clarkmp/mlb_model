@@ -25,7 +25,7 @@ CACHE_DIR = Path("cache")
 BULK_DATASET_URL = "https://github.com/ArnavSaraogi/mlb-odds-scraper/releases/download/dataset/mlb_odds.json"
 BULK_DATASET_CACHE = CACHE_DIR / "bulk_odds_2021_2025.json"
 SCRAPED_ODDS_CACHE = CACHE_DIR / "scraped_odds_2026.json"
-MERGED_ODDS_CACHE = CACHE_DIR / "merged_historical_odds.parquet"
+MERGED_ODDS_CACHE = CACHE_DIR / "merged_historical_odds.pkl"
 
 # Scraper files (copied from upload)
 SCRAPER_DIR = Path(__file__).parent / "scraper"
@@ -38,42 +38,31 @@ def _ensure_cache_dir():
 
 
 def _download_bulk_dataset():
-    """Download the 76MB bulk dataset from GitHub releases."""
+    """
+    Use the uploaded bulk dataset from /mnt/user-data/uploads or cache.
+    Does NOT attempt GitHub download (URL returns 404).
+    """
     _ensure_cache_dir()
     
+    # Check cache first
     if BULK_DATASET_CACHE.exists():
         print(f"  Bulk dataset already cached at {BULK_DATASET_CACHE}")
         return BULK_DATASET_CACHE
     
-    print(f"  Downloading bulk odds dataset (76 MB) from GitHub...")
-    print(f"  URL: {BULK_DATASET_URL}")
-    
-    try:
-        resp = requests.get(BULK_DATASET_URL, stream=True, timeout=120)
-        resp.raise_for_status()
-        
-        # Stream to file with progress
-        total_size = int(resp.headers.get('content-length', 0))
-        chunk_size = 1024 * 1024  # 1MB chunks
-        downloaded = 0
-        
-        with open(BULK_DATASET_CACHE, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=chunk_size):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size:
-                        pct = (downloaded / total_size) * 100
-                        print(f"    {pct:.1f}% ({downloaded // (1024*1024)} / {total_size // (1024*1024)} MB)", end='\r')
-        
-        print(f"\n  Downloaded to {BULK_DATASET_CACHE}")
+    # Use uploaded file
+    uploaded_path = Path("/mnt/user-data/uploads/mlb_odds_dataset.json")
+    if uploaded_path.exists():
+        print(f"  Using uploaded bulk dataset ({uploaded_path.stat().st_size // (1024*1024)} MB)...")
+        print(f"  Copying to cache...")
+        import shutil
+        shutil.copy(uploaded_path, BULK_DATASET_CACHE)
+        print(f"  ✓ Cached to {BULK_DATASET_CACHE}")
         return BULK_DATASET_CACHE
     
-    except Exception as e:
-        print(f"  Failed to download bulk dataset: {e}")
-        if BULK_DATASET_CACHE.exists():
-            BULK_DATASET_CACHE.unlink()
-        return None
+    # No uploaded file found
+    print(f"  ERROR: Bulk dataset not found at {uploaded_path}")
+    print(f"  Please upload mlb_odds_dataset.json to /mnt/user-data/uploads/")
+    return None
 
 
 def _parse_bulk_dataset(json_path):
@@ -278,7 +267,7 @@ def load_historical_odds(seasons, enable_scraping=False):
         cache_age = datetime.now().timestamp() - MERGED_ODDS_CACHE.stat().st_mtime
         if cache_age < 86400:  # 24 hours
             print(f"  Using cached historical odds (age: {cache_age/3600:.1f}h)")
-            return pd.read_parquet(MERGED_ODDS_CACHE)
+            return pd.read_pickle(MERGED_ODDS_CACHE)
     
     # ── Load bulk dataset ─────────────────────────────────────────────────
     bulk_path = _download_bulk_dataset()
@@ -313,7 +302,7 @@ def load_historical_odds(seasons, enable_scraping=False):
     print(f"  Filtered to {len(filtered)} games across seasons {seasons}")
     
     # ── Cache the merged result ───────────────────────────────────────────
-    filtered.to_parquet(MERGED_ODDS_CACHE, index=False)
+    filtered.to_pickle(MERGED_ODDS_CACHE)
     print(f"  Cached to {MERGED_ODDS_CACHE}")
     
     return filtered
