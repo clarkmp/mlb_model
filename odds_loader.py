@@ -39,8 +39,10 @@ def _ensure_cache_dir():
 
 def _download_bulk_dataset():
     """
-    Use the uploaded bulk dataset from /mnt/user-data/uploads or cache.
-    Does NOT attempt GitHub download (URL returns 404).
+    Use the bulk dataset from:
+      1. Cache (if already processed)
+      2. Same directory as this script (~/mlb_model/)
+      3. Uploads directory (/mnt/user-data/uploads/)
     """
     _ensure_cache_dir()
     
@@ -49,19 +51,34 @@ def _download_bulk_dataset():
         print(f"  Bulk dataset already cached at {BULK_DATASET_CACHE}")
         return BULK_DATASET_CACHE
     
-    # Use uploaded file
+    # Check same directory as script (~/mlb_model/)
+    script_dir = Path(__file__).parent
+    local_path = script_dir / "mlb_odds_dataset.json"
+    if local_path.exists():
+        print(f"  Found bulk dataset in mlb_model directory ({local_path.stat().st_size // (1024*1024)} MB)...")
+        print(f"  Copying to cache...")
+        import shutil
+        shutil.copy(local_path, BULK_DATASET_CACHE)
+        print(f"  ✓ Cached to {BULK_DATASET_CACHE}")
+        return BULK_DATASET_CACHE
+    
+    # Check uploads directory
     uploaded_path = Path("/mnt/user-data/uploads/mlb_odds_dataset.json")
     if uploaded_path.exists():
-        print(f"  Using uploaded bulk dataset ({uploaded_path.stat().st_size // (1024*1024)} MB)...")
+        print(f"  Found bulk dataset in uploads directory ({uploaded_path.stat().st_size // (1024*1024)} MB)...")
         print(f"  Copying to cache...")
         import shutil
         shutil.copy(uploaded_path, BULK_DATASET_CACHE)
         print(f"  ✓ Cached to {BULK_DATASET_CACHE}")
         return BULK_DATASET_CACHE
     
-    # No uploaded file found
-    print(f"  ERROR: Bulk dataset not found at {uploaded_path}")
-    print(f"  Please upload mlb_odds_dataset.json to /mnt/user-data/uploads/")
+    # No file found anywhere
+    print(f"  ERROR: Bulk dataset not found!")
+    print(f"  Looked in:")
+    print(f"    1. {BULK_DATASET_CACHE}")
+    print(f"    2. {local_path}")
+    print(f"    3. {uploaded_path}")
+    print(f"  Please place mlb_odds_dataset.json in ~/mlb_model/ directory")
     return None
 
 
