@@ -430,6 +430,15 @@ def run_live(model, history_df):
         return
 
     odds_df   = fetch_mlb_odds()
+    
+    # Deduplicate: keep the row with most bookmakers for each unique game
+    # The Odds API sometimes returns the same game multiple times with different odds
+    if not odds_df.empty:
+        odds_df = (odds_df.sort_values('n_books', ascending=False)
+                   .drop_duplicates(subset=['home_team', 'away_team'], keep='first')
+                   .reset_index(drop=True))
+        print(f"  Deduplicated to {len(odds_df)} unique games")
+    
     season    = datetime.now().year
     game_list = _build_upcoming_features(today_df, history_df)
 
