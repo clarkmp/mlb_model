@@ -12,7 +12,6 @@ Usage:
 Bet types produced in live mode:
     - Moneyline        (The Odds API)
     - Run line spread  (The Odds API, -1.5 / +1.5)
-    - 3-leg parlay     (top 3 moneyline edges combined)
 """
 
 import os, argparse, json, time
@@ -38,7 +37,6 @@ from mlb_model import (
 )
 from mlb_betting import (
     evaluate_moneyline, evaluate_spread,
-    build_parlay,
     run_backtest, edge_buckets, monthly_performance,
     american_to_decimal,
 )
@@ -53,7 +51,7 @@ CONFIG = {
     "seasons":          [_CURRENT_YEAR - 3, _CURRENT_YEAR - 2,
                          _CURRENT_YEAR - 1, _CURRENT_YEAR],
     "initial_bankroll": 250.0,
-    "min_edge":         0.25,   # 25% minimum edge — extremely selective
+    "min_edge":         0.20,   # 20% minimum edge — very selective
     "kelly_frac":       0.25,
     "max_stake_pct":    0.03,    # hard cap: 3% of bankroll per bet
     "min_train_games":  300,
@@ -548,18 +546,6 @@ def run_live(model, history_df):
                 all_recs.append(rl)
 
 
-
-    # ── 3-leg parlay — built from the top qualifying ML bets only ─────────
-    # Pre-filter to BET-only before building parlay so we don't combine weak legs
-    ml_bets_for_parlay = sorted(
-        [r for r in ml_recs if r.verdict == "BET"],
-        key=lambda x: x.edge, reverse=True
-    )
-    parlay = build_parlay(ml_bets_for_parlay, bankroll,
-                          kelly_frac=0.10, max_stake_pct=0.02)
-    if parlay:
-        all_recs.append(parlay)
-
     # ── Build per-game lookup maps ─────────────────────────────────────────
     # Index ML and RL recs by game_pk so we can print them together per game
     ml_by_pk = {r.game_pk: r for r in ml_recs}
@@ -633,34 +619,13 @@ def run_live(model, history_df):
     if rl_printed == 0:
         print("  No run line odds available today.")
 
-    # ── 3-leg parlay ─────────────────────────────────────────────────────
-    section("3-leg parlay recommendation")
-    if parlay and parlay.verdict == "BET":
-        tag_p   = "★ BET"
-        edge_s  = f"+{parlay.edge*100:.1f}%"
-        odds_s  = f"{int(parlay.american_odds):+d}"
-        stake_s = f"${parlay.stake:.2f}"
-        print(f"  ┌─ 3-LEG PARLAY  {odds_s}  "
-              f"Prob:{parlay.model_prob*100:.1f}%  Edge:{edge_s}  Stake:{stake_s}  [{tag_p}]")
-        for leg in parlay.bet_side.split("\n    "):
-            print(f"  │  {leg.strip()}")
-        print(f"  └─ Note: {' | '.join(parlay.notes)}")
-    elif len(ml_bets) < 3:
-        print(f"  Need 3 qualifying moneyline bets to build a parlay "
-              f"({len(ml_bets)} found today).")
-    else:
-        print("  Parlay edge below threshold — not recommended today.")
-
     # ── Summary ───────────────────────────────────────────────────────────
     section("daily summary")
     all_bets    = ml_bets + rl_bets
     total_stake = sum(r.stake for r in all_bets)
-    if parlay and parlay.verdict == "BET":
-        total_stake += parlay.stake
     kv("Games listed:",        len(ordered_pks))
     kv("Moneyline bets (★):",  len(ml_bets))
     kv("Run line bets (★):",   len(rl_bets))
-    kv("Parlay:",              "★ BET" if parlay and parlay.verdict == "BET" else "pass")
     kv("Total stake today:",   f"${total_stake:.2f}")
     kv("Bankroll:",            f"${bankroll:,.2f}")
     kv("Edge threshold:",      f"{CONFIG['min_edge']:.0%} — below this = pass")
